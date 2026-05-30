@@ -146,10 +146,22 @@ print(f"  Data: {len(target_vals)} rows | Current {TARGET}: ${current_price:.2f}
 # Save CSV for model inference
 df[['close', 'helper']].to_csv(DATA_CSV)
 
+def td_label(count):
+    if count is None or count == 0:
+        return "—"
+    if count == 9:
+        return "⚠️ TD 9 — Potential Reversal"
+    if count >= 10:
+        return f"Countdown ({count})"
+    if count >= 5:
+        return "Setup Active"
+    return "Setup Building"
+
 # ── DATA-ONLY MODE: output JSON and exit ──
 if DATA_ONLY:
     print(f"[STATUS:data_ready:done]", flush=True)
     # Output metadata as JSON to stdout for the Flask process to consume
+    td_count = int(df['td_count'].iloc[-1])
     metadata = {
         "target": TARGET,
         "helper": HELPER,
@@ -161,14 +173,13 @@ if DATA_ONLY:
         "csv_path": DATA_CSV,
         "chart_path": OUT_CHART,
         "data_range_raw": START if PERIOD else args.start,
-        # Technical indicators for parsing
         "rsi": float(df['RSI_14'].iloc[-1]),
         "ema_50": float(df['EMA_50'].iloc[-1]),
         "bb_upper": float(df['BBU_20'].iloc[-1]),
-        "td_count": int(df['td_count'].iloc[-1]),
+        "td_count": td_count,
         "rsi_label": "[OVERBOUGHT]" if float(df['RSI_14'].iloc[-1]) > 70 else "[OVERSOLD]" if float(df['RSI_14'].iloc[-1]) < 30 else "[STABLE]",
         "ema_label": "BULLISH" if current_price > float(df['EMA_50'].iloc[-1]) else "BEARISH",
-        "td_label": "!!! SELL FLIP !!!" if int(df['td_count'].iloc[-1]) >= 8 else "Trend Continuing",
+        "td_label": "⚠️ TD 9 — Potential Reversal" if td_count == 9 else f"Countdown ({td_count})" if td_count >= 10 else "Setup Active" if td_count >= 5 else "Setup Building" if td_count > 0 else "—",
         "vol_label": "OVEREXTENDED" if current_price > float(df['BBU_20'].iloc[-1]) else "NORMAL",
     }
     print(f"[METADATA_JSON]{json.dumps(metadata)}[/METADATA_JSON]", flush=True)
@@ -179,7 +190,6 @@ if DATA_ONLY:
     print(f"  Rows: {len(target_vals)}")
     print(f"{'='*60}\n")
     sys.exit(0)
-
 # ==========================================
 # 2. RUN MODELS (subprocess mode — original behavior)
 # ==========================================
@@ -526,7 +536,7 @@ bb_u     = float(df['BBU_20'].iloc[-1])
 rsi_label = '[OVERBOUGHT]' if rsi_val > 70 else '[OVERSOLD]' if rsi_val < 30 else '[STABLE]'
 print(f"| RSI (14)    : {rsi_val:6.2f} | {rsi_label}")
 print(f"| EMA 50      : {'BULLISH' if current_price > ema_50 else 'BEARISH':>12} | (EMA: ${ema_50:.2f})")
-print(f"| TD SETUP    : {td_count:>12} | {'!!! SELL FLIP !!!' if td_count >= 8 else 'Trend Continuing'}")
+print(f"| TD SETUP    : {td_count:>12} | {td_label(td_count)}")
 bb_label  = 'OVEREXTENDED' if current_price > bb_u else 'NORMAL'
 print(f"| VOLATILITY  : {bb_label:>12} | (BB Upper: ${bb_u:.2f})")
 

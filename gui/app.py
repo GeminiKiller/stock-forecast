@@ -809,6 +809,7 @@ h1 span{color:#ff6b35}
 .field{display:flex;flex-direction:column;gap:3px}
 .field label{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:0.5px;padding-left:2px}
 .form input,.form select{background:#1a1a1a;border:1px solid #333;color:#00ff88;padding:8px 12px;border-radius:2px;font-size:13px;font-family:inherit;outline:none;width:110px}
+#target{padding-right:28px}
 .form input:focus,.form select:focus{border-color:#00ff88}
 .form input::placeholder{color:#444}
 .form button{background:#00ff88;color:#0c0c0c;border:none;padding:8px 20px;border-radius:2px;font-size:13px;font-family:inherit;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:1px}
@@ -870,8 +871,10 @@ h1 span{color:#ff6b35}
 .preview-item .pv.down{color:#ff4444}
 .sentiment-counts{font-size:11px;color:#666;margin:4px 0;display:flex;gap:12px}
 .sentiment-counts span{display:flex;align-items:center;gap:4px}
-.watch-btn{position:absolute;right:8px;top:32px;background:none;border:none;color:#888;cursor:pointer;font-size:16px;padding:4px}
-.watch-btn.active{color:#ffd700}
+.watch-btn{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:transparent;border:none;color:#555;cursor:pointer;font-size:13px;padding:2px 4px;line-height:1;transition:color .2s;z-index:10}
+.watch-btn:hover{color:#888}
+.watch-btn.active{color:#00ff88}
+.watch-btn.active:hover{color:#33ffaa}
 .watchlist-bar{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;justify-content:center;min-height:28px}
 .watch-chip{font-size:11px;background:#1a1a1a;border:1px solid #333;padding:4px 10px;border-radius:3px;cursor:pointer;color:#ccc;display:flex;align-items:center;gap:6px}
 .watch-chip:hover{background:#222}
@@ -903,7 +906,7 @@ h1 span{color:#ff6b35}
   <div id="wsStatus" class="ws-status disconnected">⬤ offline</div>
 
   <div class="form">
-    <div class="field autocomplete-wrapper"><label>Target</label><input id="target" placeholder="e.g. APLD" value="APLD" autocomplete="off"><div id="targetAC" class="autocomplete-list"></div><button id="watchBtn" class="watch-btn" title="Add to watchlist" onclick="toggleWatch()">⭐</button></div>
+    <div class="field autocomplete-wrapper"><label>Target</label><input id="target" placeholder="e.g. APLD" value="APLD" autocomplete="off"><div id="targetAC" class="autocomplete-list"></div><button id="watchBtn" class="watch-btn" title="Add to watchlist" onclick="toggleWatch()">☆</button></div>
     <div class="field autocomplete-wrapper"><label>Helper</label><input id="helper" placeholder="e.g. NVDA" value="NVDA" autocomplete="off"><div id="helperAC" class="autocomplete-list"></div></div>
     <div class="field"><label>Horizon</label><select id="horizon"><option value="5">5d</option><option value="12" selected>12d</option><option value="20">20d</option><option value="30">30d</option></select></div>
     <div class="field"><label>Data Range</label><select id="dataRange" onchange="checkResources()"><option value="3m" selected>3mo</option><option value="6m">6mo</option><option value="1y">1yr ⚠️</option><option value="2y">2yr ⚠️</option><option value="5y">5yr 🔴</option><option value="max">Max 🔴</option></select></div>
@@ -1390,8 +1393,8 @@ function toggleWatch(){
 function syncWatchBtn(t){
   var btn=document.getElementById('watchBtn');
   if(!btn)return;
-  if(isWatched(t)){ btn.classList.add('active'); btn.title='Remove from watchlist'; }
-  else{ btn.classList.remove('active'); btn.title='Add to watchlist'; }
+  if(isWatched(t)){ btn.classList.add('active'); btn.innerHTML='★'; btn.title='Remove from watchlist'; }
+  else{ btn.classList.remove('active'); btn.innerHTML='☆'; btn.title='Add to watchlist'; }
 }
 function renderWatchlist(){
   var bar=document.getElementById('watchlistBar');

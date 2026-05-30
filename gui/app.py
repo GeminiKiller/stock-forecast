@@ -341,20 +341,8 @@ def _job_lifecycle(jid):
             band_lo = ensemble_median - resid_scale
             band_hi = ensemble_median + resid_scale
         elif len(all_preds) == 1:
-            df_data = pd.read_csv(csv_path, index_col=0, parse_dates=True)
-            target_vals = df_data['close'].values.astype(np.float32)
-            X_cal = np.arange(len(target_vals)-30, len(target_vals)).reshape(-1, 1)
-            y_cal = target_vals[-30:].ravel()
-            mapie = SplitConformalRegressor(
-                estimator=LinearRegression().fit(X_cal, y_cal),
-                confidence_level=0.9, prefit=True
-            )
-            mapie.conformalize(X_cal, y_cal)
-            _, y_pis = mapie.predict_interval(
-                np.arange(len(target_vals), len(target_vals)+horizon).reshape(-1, 1)
-            )
-            band_lo = y_pis[:, 0, 0]
-            band_hi = y_pis[:, 1, 0]
+            # Only 1 model — skip MAPIE band, model's own CI is sufficient
+            pass
 
         _emit_progress(jid, 'conformal', 'done', '[STATUS:conformal:done]')
     except Exception as e:

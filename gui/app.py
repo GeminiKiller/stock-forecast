@@ -729,7 +729,7 @@ body{font-family:'SF Mono','Fira Code','Cascadia Code',monospace;background:#0c0
 h1{font-size:20px;padding:16px 0 4px;color:#00ff88;font-weight:400;letter-spacing:2px;text-transform:uppercase}
 h1 span{color:#ff6b35}
 .subtitle{color:#555;margin-bottom:20px;font-size:11px;letter-spacing:1px}
-.form{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:10px;align-items:flex-start}
+.form{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:10px}
 .field{display:flex;flex-direction:column;gap:3px}
 .field label{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:0.5px;padding-left:2px}
 .form input,.form select{background:#1a1a1a;border:1px solid #333;color:#00ff88;padding:8px 12px;border-radius:2px;font-size:13px;font-family:inherit;outline:none;width:110px}

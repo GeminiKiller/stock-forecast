@@ -809,7 +809,7 @@ h1 span{color:#ff6b35}
 .field{display:flex;flex-direction:column;gap:3px}
 .field label{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:0.5px;padding-left:2px}
 .form input,.form select{background:#1a1a1a;border:1px solid #333;color:#00ff88;padding:8px 12px;border-radius:2px;font-size:13px;font-family:inherit;outline:none;width:110px}
-#target{padding-right:28px}
+
 .form input:focus,.form select:focus{border-color:#00ff88}
 .form input::placeholder{color:#444}
 .form button{background:#00ff88;color:#0c0c0c;border:none;padding:8px 20px;border-radius:2px;font-size:13px;font-family:inherit;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:1px}
@@ -871,42 +871,11 @@ h1 span{color:#ff6b35}
 .preview-item .pv.down{color:#ff4444}
 .sentiment-counts{font-size:11px;color:#666;margin:4px 0;display:flex;gap:12px}
 .sentiment-counts span{display:flex;align-items:center;gap:4px}
-.watch-btn{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:transparent;border:none;color:#555;cursor:pointer;font-size:13px;padding:2px 4px;line-height:1;transition:color .2s;z-index:10}
-.watch-btn:hover{color:#888}
-.watch-btn.active{color:#00ff88}
-.watch-btn.active:hover{color:#33ffaa}
-.watchlist-bar{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;justify-content:center;min-height:28px}
-.watch-chip{font-size:11px;background:#1a1a1a;border:1px solid #333;padding:4px 10px;border-radius:3px;cursor:pointer;color:#ccc;display:flex;align-items:center;gap:6px}
-.watch-chip:hover{background:#222}
-.watch-chip .x{color:#666;font-size:10px;margin-left:2px}
-.watch-chip .x:hover{color:#ff4444}
-.trend-improving{color:#00ff88}
-.trend-stable{color:#888}
-.trend-deteriorating{color:#ff4444}
-.ai-score-big{font-size:20px;font-weight:700;margin:8px 0}
-.ai-score-big .score-num{font-size:28px}
-.ai-components{display:flex;gap:8px;font-size:10px;color:#888;margin:4px 0}
-.ai-components span{padding:2px 6px;background:#1a1a1a;border-radius:2px}
-.fund-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px 12px;font-size:11px;margin:8px 0}
-.fund-item{display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px solid #1a1a1a}
-.fund-item .fk{color:#666}.fund-item .fv{color:#ccc;font-weight:500}
-.sentiment-summary{font-size:12px;margin-bottom:8px;padding:6px 0;border-bottom:1px solid #1a1a1a}
-.sentiment-summary .ss-label{font-weight:700}
-.sentiment-summary .ss-bullish{color:#00ff88}.sentiment-summary .ss-bearish{color:#ff4444}.sentiment-summary .ss-neutral{color:#888}
-</style>
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.2.1/dist/chartjs-chart-financial.min.js"></script>
-</head><body>
-<div class="container">
-  <h1>⚡ <span>Forecast</span> <span style="font-size:10px;color:#444">v2</span></h1>
-  <p class="subtitle">TIMESFM 2.5 · CHRONOS-2 · LSTM · CONFORMAL CALIBRATION · TD SEQUENTIAL · <span style="color:#00ff88">REAL-TIME WS</span></p>
 
   <div id="wsStatus" class="ws-status disconnected">⬤ offline</div>
 
   <div class="form">
-    <div class="field autocomplete-wrapper"><label>Target</label><input id="target" placeholder="e.g. APLD" value="APLD" autocomplete="off"><div id="targetAC" class="autocomplete-list"></div><button id="watchBtn" class="watch-btn" title="Add to watchlist" onclick="toggleWatch()">☆</button></div>
+    <div class="field autocomplete-wrapper"><label>Target</label><input id="target" placeholder="e.g. APLD" value="APLD" autocomplete="off"><div id="targetAC" class="autocomplete-list"></div></div>
     <div class="field autocomplete-wrapper"><label>Helper</label><input id="helper" placeholder="e.g. NVDA" value="NVDA" autocomplete="off"><div id="helperAC" class="autocomplete-list"></div></div>
     <div class="field"><label>Horizon</label><select id="horizon"><option value="5">5d</option><option value="12" selected>12d</option><option value="20">20d</option><option value="30">30d</option></select></div>
     <div class="field"><label>Data Range</label><select id="dataRange" onchange="checkResources()"><option value="3m" selected>3mo</option><option value="6m">6mo</option><option value="1y">1yr ⚠️</option><option value="2y">2yr ⚠️</option><option value="5y">5yr 🔴</option><option value="max">Max 🔴</option></select></div>
@@ -1388,31 +1357,33 @@ function toggleWatch(){
   var t=val('target');
   if(!t)return;
   if(isWatched(t)){ removeFromWatchlist(t); }else{ addToWatchlist(t); }
-  syncWatchBtn(t);
+  renderWatchlist();
 }
 function syncWatchBtn(t){
-  var btn=document.getElementById('watchBtn');
-  if(!btn)return;
-  if(isWatched(t)){ btn.classList.add('active'); btn.innerHTML='★'; btn.title='Remove from watchlist'; }
-  else{ btn.classList.remove('active'); btn.innerHTML='☆'; btn.title='Add to watchlist'; }
+  // No more star button — watchlist bar handles everything
+  renderWatchlist();
 }
 function renderWatchlist(){
   var bar=document.getElementById('watchlistBar');
   if(!bar)return;
-  bar.innerHTML='';
-  if(_watchlist.length===0)return;
-  _watchlist.forEach(function(t){
-    var chip=document.createElement('div');
-    chip.className='watch-chip';
-    chip.textContent=t;
-    chip.onclick=function(){ document.getElementById('target').value=t; onTargetChange(); };
-    var x=document.createElement('span');
-    x.className='x';
-    x.textContent='✕';
-    x.onclick=function(e){ e.stopPropagation(); removeFromWatchlist(t); syncWatchBtn(val('target')); };
-    chip.appendChild(x);
-    bar.appendChild(chip);
+  var t=val('target');
+  var watched=t&&isWatched(t);
+  var addHtml='';
+  if(t&&!watched){
+    addHtml='<div class="watch-add" onclick="addToWatchlist(val('target'));syncWatchBtn(val('target'));">+ Watch '+escHtml(t)+'</div>';
+  }else if(watched&&t){
+    addHtml='<div class="watch-add watching" onclick="removeFromWatchlist(val('target'));syncWatchBtn(val('target'));">★ Watching '+escHtml(t)+'</div>';
+  }
+  if(_watchlist.length===0&&!t){
+    bar.innerHTML='<span class="watch-empty">No watchlist items</span>';
+    return;
+  }
+  var h=addHtml;
+  _watchlist.forEach(function(sym){
+    var active=sym===t;
+    h+='<div class="watch-chip'+(active?' active':'')+'" onclick="document.getElementById('target').value=''+sym+'';onTargetChange();">'+sym+'<span class="x" onclick="event.stopPropagation();removeFromWatchlist(''+sym+'');syncWatchBtn(''+sym+'');">✕</span></div>';
   });
+  bar.innerHTML=h;
 }
 
 // ── Autocomplete ──

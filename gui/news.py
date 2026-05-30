@@ -5,6 +5,12 @@ import urllib.request
 import re
 from datetime import datetime
 
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    _sid = SentimentIntensityAnalyzer()
+except ImportError:
+    _sid = None
+
 
 def fetch_yahoo_rss(ticker: str, max_items: int = 15) -> list[dict]:
     """Fetch latest news from Yahoo Finance RSS feed."""
@@ -125,14 +131,68 @@ def fetch_earnings_date(ticker: str) -> dict:
         return {"available": False, "message": str(e)}
 
 
+def analyze_sentiment(headlines: list[dict]) -> list[dict]:
+    """Add VADER sentiment scores to each news headline dict.
+    
+    Adds: sentiment.compound, sentiment.pos, sentiment.neu, sentiment.neg
+    Returns the same list with sentiment field added to each dict.
+    """
+    if _sid is None:
+        return headlines
+    for item in headlines:
+        text = item.get("title", "") or ""
+        if not text:
+            item["sentiment"] = {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0}
+            continue
+        scores = _sid.polarity_scores(text)
+        item["sentiment"] = {
+            "compound": round(scores["compound"], 4),
+            "pos": round(scores["pos"], 4),
+            "neu": round(scores["neu"], 4),
+            "neg": round(scores["neg"], 4),
+        }
+    return headlines
+
+
+def compute_sentiment_summary(headlines: list[dict]) -> dict:
+    """Compute an overall sentiment summary from a list of news dicts with sentiment scores.
+    
+    Returns: {"label": "Bullish"/"Bearish"/"Neutral", "emoji": "🟢"/"🔴"/"⚪", "avg_compound": float}
+    """
+    compounds = []
+    for item in headlines:
+        s = item.get("sentiment", {})
+        c = s.get("compound")
+        if c is not None:
+            compounds.append(c)
+    if not compounds:
+        return {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0}
+    avg = sum(compounds) / len(compounds)
+    if avg > 0.05:
+        label, emoji = "Bullish", "🟢"
+    elif avg < -0.05:
+        label, emoji = "Bearish", "🔴"
+    else:
+        label, emoji = "Neutral", "⚪"
+    return {"label": label, "emoji": emoji, "avg_compound": round(avg, 4)}
+
+
 def get_news_and_ratings(ticker: str) -> dict:
-    """Combined news + analyst data + earnings."""
+    """Combined news + analyst data + earnings + sentiment."""
+    news = fetch_yahoo_rss(ticker)
+    # Filter out error-only items before sentiment analysis
+    valid_news = [n for n in news if "error" not in n]
+    analyze_sentiment(valid_news)
+    summary = compute_sentiment_summary(valid_news)
+    # Merge valid news back (error items go at the end unchanged)
+    processed = valid_news + [n for n in news if "error" in n]
     return {
         "ticker": ticker.upper(),
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "analyst": fetch_analyst_ratings(ticker),
         "earnings": fetch_earnings_date(ticker),
-        "news": fetch_yahoo_rss(ticker),
+        "news": processed,
+        "sentiment_summary": summary,
     }
 
 

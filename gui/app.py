@@ -9,7 +9,7 @@ Changes from v1:
 
 Run:  python gui/app.py [port]
 """
-import os, sys, json, re, time, subprocess, threading, traceback
+import os, sys, json, re, time, subprocess, threading, traceback, urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from flask import Flask, request, jsonify, send_file, render_template_string
 from flask_socketio import SocketIO, emit as socketio_emit
 import numpy as np
+import pandas as pd
 
 WORKSPACE  = Path(__file__).resolve().parent.parent
 FORECAST   = WORKSPACE / "forecast.py"
@@ -476,11 +477,13 @@ def _job_lifecycle(jid):
         result["news"] = nd.get("news", [])[:10]
         result["analyst"] = nd.get("analyst", {"available": False})
         result["earnings"] = nd.get("earnings", {"available": False})
+        result["sentiment_summary"] = nd.get("sentiment_summary", {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0})
     except Exception as e:
         _emit_progress(jid, 'news', 'failed', f'[STATUS:news:failed] {e}')
         result["news"] = []
         result["analyst"] = {"available": False}
         result["earnings"] = {"available": False}
+        result["sentiment_summary"] = {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0}
 
     # Clean up
     with _jobs_lock:
@@ -552,9 +555,156 @@ def api_news(ticker):
             "news": nd.get("news", [])[:10],
             "analyst": nd.get("analyst", {"available": False}),
             "earnings": nd.get("earnings", {"available": False}),
+            "sentiment_summary": nd.get("sentiment_summary", {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0}),
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/preview/<ticker>")
+def api_preview(ticker):
+    """Fast technical indicator preview — no model inference, no chart generation."""
+    ticker = ticker.upper()
+    try:
+        import yfinance as yf
+
+        data_range = request.args.get("data_range", "3m").lower()
+        range_map = {"3m": "3mo", "6m": "6mo", "1y": "1y", "2y": "2y", "5y": "5y", "max": "max"}
+        period = range_map.get(data_range, "3mo")
+
+        # Download data
+        raw = yf.download([ticker], period=period, auto_adjust=True, progress=False)
+        if len(raw) == 0:
+            return jsonify({"error": f"No data found for {ticker}"}), 404
+
+        df = pd.DataFrame(index=raw.index)
+        close_col = ('Close', ticker) if ('Close', ticker) in raw.columns else 'Close'
+        if isinstance(raw[close_col], pd.DataFrame):
+            df['close'] = raw[close_col].iloc[:, 0].ffill()
+        else:
+            df['close'] = raw[close_col].ffill()
+        df.dropna(inplace=True)
+
+        if len(df) == 0:
+            return jsonify({"error": f"No data found for {ticker}"}), 404
+
+        target_vals = df['close'].values.astype(float)
+        current_price = float(target_vals[-1])
+
+        # Compute indicators (same as forecast.py)
+        def compute_rsi(series, length=14):
+            delta = series.diff()
+            gain = delta.where(delta > 0, 0.0).rolling(window=length).mean()
+            loss = (-delta.where(delta < 0, 0.0)).rolling(window=length).mean()
+            rs = gain / loss
+            return 100.0 - (100.0 / (1.0 + rs))
+
+        def compute_ema(series, length=50):
+            return series.ewm(span=length, adjust=False).mean()
+
+        def compute_bbands(series, length=20, std=2.0):
+            sma = series.rolling(window=length).mean()
+            rstd = series.rolling(window=length).std()
+            return sma + rstd * std, sma, sma - rstd * std
+
+        def get_td_setup(arr):
+            setup = np.zeros(len(arr))
+            count = 0
+            for i in range(4, len(arr)):
+                count = count + 1 if arr[i] > arr[i-4] else 0
+                setup[i] = count
+            return setup
+
+        df['RSI_14'] = compute_rsi(df['close'], 14)
+        df['EMA_50'] = compute_ema(df['close'], 50)
+        df['BBU_20'], df['BBM_20'], df['BBL_20'] = compute_bbands(df['close'], 20, 2.0)
+        df['td_count'] = get_td_setup(df['close'].values)
+
+        rsi_val = float(df['RSI_14'].iloc[-1]) if not pd.isna(df['RSI_14'].iloc[-1]) else None
+        ema_50 = float(df['EMA_50'].iloc[-1]) if not pd.isna(df['EMA_50'].iloc[-1]) else None
+        bb_upper = float(df['BBU_20'].iloc[-1]) if not pd.isna(df['BBU_20'].iloc[-1]) else None
+        td_count = int(df['td_count'].iloc[-1])
+
+        # Labels
+        rsi_label = "[OVERBOUGHT]" if rsi_val and rsi_val > 70 else "[OVERSOLD]" if rsi_val and rsi_val < 30 else "[STABLE]"
+        ema_label = "BULLISH" if ema_50 and current_price > ema_50 else "BEARISH"
+        td_label = "⚠️ TD 9" if td_count == 9 else f"Countdown ({td_count})" if td_count >= 10 else "Setup Active" if td_count >= 5 else "Setup Building" if td_count > 0 else "—"
+        vol_label = "OVEREXTENDED" if bb_upper and current_price > bb_upper else "NORMAL"
+
+        # 52-week high/low
+        info = {}
+        try:
+            t = yf.Ticker(ticker)
+            info = t.info or {}
+        except:
+            pass
+        wk52_high = info.get("fiftyTwoWeekHigh")
+        wk52_low = info.get("fiftyTwoWeekLow")
+        company_name = info.get("shortName", ticker)
+
+        # Also fetch news + sentiment for this ticker
+        try:
+            from news import get_news_and_ratings
+            nd = get_news_and_ratings(ticker)
+            news = nd.get("news", [])[:10]
+            sentiment_summary = nd.get("sentiment_summary", {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0})
+            analyst = nd.get("analyst", {"available": False})
+            earnings = nd.get("earnings", {"available": False})
+        except:
+            news = []
+            sentiment_summary = {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0}
+            analyst = {"available": False}
+            earnings = {"available": False}
+
+        return jsonify({
+            "ticker": ticker,
+            "name": company_name,
+            "current_price": round(current_price, 2),
+            "rsi": round(rsi_val, 2) if rsi_val else None,
+            "rsi_label": rsi_label,
+            "ema_50": round(ema_50, 2) if ema_50 else None,
+            "ema_label": ema_label,
+            "td_count": td_count,
+            "td_label": td_label,
+            "bb_upper": round(bb_upper, 2) if bb_upper else None,
+            "vol_label": vol_label,
+            "52wk_high": wk52_high,
+            "52wk_low": wk52_low,
+            "news": news,
+            "sentiment_summary": sentiment_summary,
+            "analyst": analyst,
+            "earnings": earnings,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/search")
+def api_search():
+    """Ticker autocomplete via Yahoo Finance search API."""
+    query = request.args.get("q", "").strip()
+    if len(query) < 1:
+        return jsonify({"results": []})
+
+    try:
+        import urllib.request
+        url = f"https://query1.finance.yahoo.com/v1/finance/search?q={urllib.parse.quote(query)}&quotesCount=8&newsCount=0&quotesQueryId=tss_query_phrase"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        results = []
+        for item in data.get("quotes", [])[:8]:
+            if item.get("quoteType") in ("EQUITY", "ETF", "CRYPTOCURRENCY", "CURRENCY", "INDEX", "MUTUALFUND", None):
+                results.append({
+                    "symbol": item.get("symbol", ""),
+                    "name": item.get("shortname", item.get("longname", "")),
+                    "type": item.get("quoteType", "EQUITY"),
+                    "exchange": item.get("exchange", ""),
+                })
+        return jsonify({"results": results})
+    except Exception as e:
+        return jsonify({"results": [], "error": str(e)})
 
 
 @app.route("/api/chart-ready/<path:chart_name>")
@@ -628,6 +778,25 @@ h1 span{color:#ff6b35}
 .ws-status{font-size:10px;color:#333;text-align:right;float:right;margin-top:-20px;margin-bottom:10px}
 .ws-status.connected{color:#00ff88}
 .ws-status.disconnected{color:#ff4444}
+.autocomplete-wrapper{position:relative;display:inline-block}
+.autocomplete-list{position:absolute;top:100%;left:0;right:0;background:#1a1a1a;border:1px solid #333;border-top:none;max-height:180px;overflow-y:auto;z-index:100;display:none}
+.autocomplete-list.active{display:block}
+.autocomplete-item{padding:5px 10px;cursor:pointer;font-size:12px;color:#c0c0c0;border-bottom:1px solid #1a1a1a}
+.autocomplete-item:hover,.autocomplete-item.selected{background:#222;color:#00ff88}
+.autocomplete-item .sym{color:#00ff88;font-weight:700;margin-right:6px}
+.autocomplete-item .exch{color:#444;font-size:10px;margin-left:4px}
+.preview-panel{background:#111;border:1px solid #222;border-radius:2px;padding:12px 16px;margin-bottom:14px;display:none}
+.preview-panel.active{display:block}
+.preview-panel h3{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px;border-bottom:1px solid #1a1a1a;padding-bottom:6px}
+.preview-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px 16px}
+.preview-item{font-size:12px;display:flex;justify-content:space-between;padding:2px 0}
+.preview-item .pk{color:#555}.preview-item .pv{color:#00ff88;font-weight:600}
+.preview-item .pv.down{color:#ff4444}
+.sentiment-bar{display:flex;height:14px;border-radius:2px;overflow:hidden;margin:6px 0}
+.sentiment-bar .sb-pos{background:#00ff88}.sentiment-bar .sb-neu{background:#444}.sentiment-bar .sb-neg{background:#ff4444}
+.sentiment-summary{font-size:12px;margin-bottom:8px;padding:6px 0;border-bottom:1px solid #1a1a1a}
+.sentiment-summary .ss-label{font-weight:700}
+.sentiment-summary .ss-bullish{color:#00ff88}.sentiment-summary .ss-bearish{color:#ff4444}.sentiment-summary .ss-neutral{color:#888}
 </style>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 </head><body>
@@ -638,8 +807,8 @@ h1 span{color:#ff6b35}
   <div id="wsStatus" class="ws-status disconnected">⬤ offline</div>
 
   <div class="form">
-    <div class="field"><label>Target</label><input id="target" placeholder="e.g. APLD" value="APLD"></div>
-    <div class="field"><label>Helper</label><input id="helper" placeholder="e.g. NVDA" value="NVDA"></div>
+    <div class="field autocomplete-wrapper"><label>Target</label><input id="target" placeholder="e.g. APLD" value="APLD" autocomplete="off"><div id="targetAC" class="autocomplete-list"></div></div>
+    <div class="field autocomplete-wrapper"><label>Helper</label><input id="helper" placeholder="e.g. NVDA" value="NVDA" autocomplete="off"><div id="helperAC" class="autocomplete-list"></div></div>
     <div class="field"><label>Horizon</label><select id="horizon"><option value="5">5d</option><option value="12" selected>12d</option><option value="20">20d</option><option value="30">30d</option></select></div>
     <div class="field"><label>Data Range</label><select id="dataRange" onchange="checkResources()"><option value="3m" selected>3mo</option><option value="6m">6mo</option><option value="1y">1yr ⚠️</option><option value="2y">2yr ⚠️</option><option value="5y">5yr 🔴</option><option value="max">Max 🔴</option></select></div>
     <div class="field"><label>&nbsp;</label><button id="btn" onclick="run()">▶ Run</button></div>
@@ -680,6 +849,11 @@ h1 span{color:#ff6b35}
   </div>
 
   <div id="cacheInfo" class="cache-status"></div>
+
+  <div id="previewPanel" class="preview-panel">
+    <h3>⚡ Quick Preview</h3>
+    <div id="previewContent"><div class="preview-item" style="color:#444">type a ticker to see technicals...</div></div>
+  </div>
 
   <div class="status" id="st"></div>
   <div id="errBox" style="display:none"></div>
@@ -870,6 +1044,12 @@ function showPredictions(d){
   th+='<div class="row"><span>EMA 50</span><span class="val">'+(t2.ema_label||'—')+' '+(t2.ema!=null?'$'+t2.ema.toFixed(2):'')+'</span></div>';
   th+='<div class="row"><span>TD</span><span class="val">'+(t2.td_count!=null?'TD '+t2.td_count:'—')+' '+(t2.td_label||'')+'</span></div>';
   th+='<div class="row"><span>VOL</span><span class="val">'+(t2.vol_label||'—')+' '+(t2.bb_upper!=null?'BB $'+t2.bb_upper.toFixed(2):'')+'</span></div>';
+  // Sentiment in technicals card
+  var ss2 = d.sentiment_summary;
+  if(ss2){
+    var scls2 = ss2.label==='Bullish'?'up':ss2.label==='Bearish'?'down':'';
+    th+='<div class="row" style="border-top:1px solid #222;margin-top:4px;padding-top:4px"><span>Sentiment</span><span class="val '+scls2+'">'+escHtml(ss2.emoji)+' '+escHtml(ss2.label)+' ('+escHtml(String(ss2.avg_compound))+')</span></div>';
+  }
   document.getElementById('tBody').innerHTML=th;
 }
 function showAnalyst(d){
@@ -881,11 +1061,133 @@ function showAnalyst(d){
   document.getElementById('aBody').innerHTML=ah;
 }
 function showNews(d){
-  var nh='';(d.news||[]).forEach(function(n){nh+='<li><a href="'+escHtml(n.url||'#')+'" target="_blank">'+escHtml(n.title||'')+'</a><div class="meta">'+escHtml(n.date||'')+'</div></li>'});
+  var nh='';
+  // Sentiment summary
+  var ss = d.sentiment_summary;
+  if(ss){
+    var cls = ss.label==='Bullish'?'ss-bullish':ss.label==='Bearish'?'ss-bearish':'ss-neutral';
+    nh+='<div class="sentiment-summary">News sentiment: <span class="ss-label '+cls+'">'+escHtml(ss.emoji)+' '+escHtml(ss.label)+' ('+escHtml(String(ss.avg_compound))+')</span></div>';
+    // Collect average sentiment for bar
+    var items = d.news||[];
+    if(items.length>0){
+      var avgPos=0, avgNeu=0, avgNeg=0, cnt=0;
+      items.forEach(function(n){
+        var s=n.sentiment;
+        if(s){avgPos+=s.pos||0;avgNeu+=s.neu||0;avgNeg+=s.neg||0;cnt++;}
+      });
+      if(cnt>0){avgPos/=cnt;avgNeu/=cnt;avgNeg/=cnt;var tot=avgPos+avgNeu+avgNeg||1;
+        nh+='<div class="sentiment-bar"><div class="sb-pos" style="width:'+(avgPos/tot*100).toFixed(1)+'%"></div><div class="sb-neu" style="width:'+(avgNeu/tot*100).toFixed(1)+'%"></div><div class="sb-neg" style="width:'+(avgNeg/tot*100).toFixed(1)+'%"></div></div>';
+      }
+    }
+  }
+  (d.news||[]).forEach(function(n){
+    var sc='';
+    if(n.sentiment){var c=n.sentiment.compound;sc=c>0.05?' 🟢':c<-0.05?' 🔴':' ⚪';}
+    nh+='<li><a href="'+escHtml(n.url||'#')+'" target="_blank">'+escHtml(n.title||'')+sc+'</a><div class="meta">'+escHtml(n.date||'')+'</div></li>';
+  });
   if(!nh)nh='<li style="color:#444">no news</li>';
   document.getElementById('nList').innerHTML=nh;
 }
-function escHtml(s){if(!s)return '';var d=document.createElement('div');d.appendChild(document.createTextNode(s));return d.innerHTML}
+
+// ── Preview (technical indicators on ticker change) ──
+var previewTimer=null;
+function loadPreview(ticker){
+  if(!ticker||ticker.length<1)return;
+  var panel=document.getElementById('previewPanel');
+  var content=document.getElementById('previewContent');
+  panel.classList.add('active');
+  content.innerHTML='<div class="preview-item" style="color:#888"><span class="spinner"></span> loading '+escHtml(ticker)+'...</div>';
+  fetch('/api/preview/'+encodeURIComponent(ticker)+'?data_range='+encodeURIComponent(val('dataRange'))).then(function(r){return r.json()}).then(function(d){
+    if(d.error){content.innerHTML='<div class="preview-item" style="color:#ff4444">'+escHtml(d.error)+'</div>';return;}
+    var h='<div class="preview-grid">';
+    h+='<div class="preview-item"><span class="pk">Price</span><span class="pv'+(d.current_price?'':'')+'">'+(d.current_price?'$'+d.current_price:'—')+'</span></div>';
+    h+='<div class="preview-item"><span class="pk">RSI 14</span><span class="pv">'+(d.rsi!=null?d.rsi.toFixed(1):'—')+' '+(d.rsi_label||'')+'</span></div>';
+    h+='<div class="preview-item"><span class="pk">EMA 50</span><span class="pv '+(d.ema_label==='BEARISH'?'down':'')+'">'+(d.ema_label||'—')+' '+(d.ema_50!=null?'$'+d.ema_50:'')+'</span></div>';
+    h+='<div class="preview-item"><span class="pk">TD</span><span class="pv">'+(d.td_count!=null?'TD '+d.td_count:'—')+' '+(d.td_label||'')+'</span></div>';
+    h+='<div class="preview-item"><span class="pk">Vol</span><span class="pv">'+(d.vol_label||'—')+'</span></div>';
+    h+='<div class="preview-item"><span class="pk">52wk High</span><span class="pv">'+(d['52wk_high']!=null?'$'+d['52wk_high'].toFixed(2):'—')+'</span></div>';
+    h+='<div class="preview-item"><span class="pk">52wk Low</span><span class="pv">'+(d['52wk_low']!=null?'$'+d['52wk_low'].toFixed(2):'—')+'</span></div>';
+    h+='</div>';
+    // Sentiment in preview
+    if(d.sentiment_summary){
+      var ss=d.sentiment_summary;
+      var cls=ss.label==='Bullish'?'ss-bullish':ss.label==='Bearish'?'ss-bearish':'ss-neutral';
+      h+='<div class="sentiment-summary" style="margin-top:8px">Sentiment: <span class="ss-label '+cls+'">'+escHtml(ss.emoji)+' '+escHtml(ss.label)+' ('+escHtml(String(ss.avg_compound))+')</span></div>';
+    }
+    content.innerHTML=h;
+  }).catch(function(e){content.innerHTML='<div class="preview-item" style="color:#ff4444">preview failed</div>';});
+}
+
+function onTargetChange(){
+  var t=val('target');
+  if(t&&t.length>=1){
+    clearTimeout(previewTimer);
+    previewTimer=setTimeout(function(){loadPreview(t);},500);
+  }else{
+    document.getElementById('previewPanel').classList.remove('active');
+  }
+}
+
+// ── Autocomplete ──
+var acTimers={};
+var acSelected={};
+
+function setupAutocomplete(inputId, listId){
+  var input=document.getElementById(inputId);
+  var list=document.getElementById(listId);
+  var selectedIdx=-1;
+
+  input.addEventListener('input',function(){
+    var q=input.value.trim();
+    clearTimeout(acTimers[inputId]);
+    selectedIdx=-1;
+    if(q.length<2){list.classList.remove('active');list.innerHTML='';return;}
+    acTimers[inputId]=setTimeout(function(){
+      fetch('/api/search?q='+encodeURIComponent(q)).then(function(r){return r.json()}).then(function(d){
+        var results=d.results||[];
+        if(!results.length){list.classList.remove('active');list.innerHTML='';return;}
+        list.innerHTML='';
+        results.forEach(function(item,i){
+          var div=document.createElement('div');
+          div.className='autocomplete-item';
+          div.innerHTML='<span class="sym">'+escHtml(item.symbol)+'</span>'+escHtml(item.name||'')+'<span class="exch">'+escHtml(item.exchange||'')+'</span>';
+          div.addEventListener('mousedown',function(e){
+            e.preventDefault();
+            input.value=item.symbol;
+            list.classList.remove('active');
+            list.innerHTML='';
+            if(inputId==='target')onTargetChange();
+          });
+          list.appendChild(div);
+        });
+        list.classList.add('active');
+      }).catch(function(){});
+    },200);
+  });
+
+  input.addEventListener('keydown',function(e){
+    var items=list.querySelectorAll('.autocomplete-item');
+    if(!items.length)return;
+    if(e.key==='ArrowDown'){e.preventDefault();selectedIdx=Math.min(selectedIdx+1,items.length-1);highlightItem(items);}
+    else if(e.key==='ArrowUp'){e.preventDefault();selectedIdx=Math.max(selectedIdx-1,-1);highlightItem(items);}
+    else if(e.key==='Enter'&&selectedIdx>=0){e.preventDefault();items[selectedIdx].dispatchEvent(new MouseEvent('mousedown'));}
+    else if(e.key==='Escape'){list.classList.remove('active');list.innerHTML='';}
+  });
+
+  input.addEventListener('blur',function(){setTimeout(function(){list.classList.remove('active');},200);});
+  input.addEventListener('focus',function(){if(list.innerHTML.trim())list.classList.add('active');});
+
+  function highlightItem(items){
+    items.forEach(function(it,i){it.classList.toggle('selected',i===selectedIdx);});
+    if(selectedIdx>=0&&items[selectedIdx])items[selectedIdx].scrollIntoView({block:'nearest'});
+  }
+}
+
+setupAutocomplete('target','targetAC');
+setupAutocomplete('helper','helperAC');
+
+// Bind target input change for preview
+document.getElementById('target').addEventListener('change', onTargetChange);
 
 // Load cache status on page load
 loadCacheStatus();

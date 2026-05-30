@@ -782,6 +782,10 @@ h1 span{color:#ff6b35}
 .preview-item .pv.down{color:#ff4444}
 .sentiment-counts{font-size:11px;color:#666;margin:4px 0;display:flex;gap:12px}
 .sentiment-counts span{display:flex;align-items:center;gap:4px}
+.trend-indicator{font-size:11px;margin-left:4px}
+.trend-improving{color:#00ff88}
+.trend-stable{color:#888}
+.trend-deteriorating{color:#ff4444}
 .sentiment-summary{font-size:12px;margin-bottom:8px;padding:6px 0;border-bottom:1px solid #1a1a1a}
 .sentiment-summary .ss-label{font-weight:700}
 .sentiment-summary .ss-bullish{color:#00ff88}.sentiment-summary .ss-bearish{color:#ff4444}.sentiment-summary .ss-neutral{color:#888}
@@ -1055,7 +1059,11 @@ function showNews(d){
   var ss = d.sentiment_summary;
   if(ss){
     var cls = ss.label==='Bullish'?'ss-bullish':ss.label==='Bearish'?'ss-bearish':'ss-neutral';
-    nh+='<div class="sentiment-summary">News sentiment: <span class="ss-label '+cls+'">'+escHtml(ss.emoji)+' '+escHtml(ss.label)+' ('+escHtml(String(ss.avg_compound))+')</span></div>';
+    var trendHtml = '';
+    if(ss.trend_emoji && ss.trend_label){
+      trendHtml = ' <span class="trend-indicator trend-'+escHtml(ss.trend)+'">'+escHtml(ss.trend_emoji)+' '+escHtml(ss.trend_label)+'</span>';
+    }
+    nh+='<div class="sentiment-summary">News sentiment: <span class="ss-label '+cls+'">'+escHtml(ss.emoji)+' '+escHtml(ss.label)+' ('+escHtml(String(ss.avg_compound))+')</span>'+trendHtml+'</div>';
     // Count emoji sentiments
     var items = d.news||[];
     if(items.length>0){
@@ -1110,7 +1118,11 @@ function loadPreview(ticker){
     if(d.sentiment_summary){
       var ss=d.sentiment_summary;
       var cls=ss.label==='Bullish'?'ss-bullish':ss.label==='Bearish'?'ss-bearish':'ss-neutral';
-      h+='<div class="sentiment-summary" style="margin-top:8px">Sentiment: <span class="ss-label '+cls+'">'+escHtml(ss.emoji)+' '+escHtml(ss.label)+' ('+escHtml(String(ss.avg_compound))+')</span></div>';
+      var trendHtml2='';
+      if(ss.trend_emoji && ss.trend_label){
+        trendHtml2=' <span class="trend-indicator trend-'+escHtml(ss.trend)+'">'+escHtml(ss.trend_emoji)+' '+escHtml(ss.trend_label)+'</span>';
+      }
+      h+='<div class="sentiment-summary" style="margin-top:8px">Sentiment: <span class="ss-label '+cls+'">'+escHtml(ss.emoji)+' '+escHtml(ss.label)+' ('+escHtml(String(ss.avg_compound))+')</span>'+trendHtml2+'</div>';
     }
     content.innerHTML=h;
   }).catch(function(e){content.innerHTML='<div class="preview-item" style="color:#ff4444">preview failed</div>';});

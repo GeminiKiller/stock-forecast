@@ -259,7 +259,7 @@ def analyze_sentiment(headlines: list[dict]) -> list[dict]:
                 item["sentiment"] = {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0, "emoji": "⚪"}
             return headlines
         for item in headlines:
-            text = item.get("title", "") or ""
+            text = (item.get("title", "") + ". " + item.get("description", "")).strip()
             if not text:
                 item["sentiment"] = {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0, "emoji": "⚪"}
                 continue
@@ -281,18 +281,17 @@ def analyze_sentiment(headlines: list[dict]) -> list[dict]:
             }
         return headlines
     
-    # FinBERT + keyword boost hybrid
+    # FinBERT path (pure — understands financial context natively)
     for item in headlines:
-        text = item.get("title", "") or ""
+        text = (item.get("title", "") + ". " + item.get("description", "")).strip()
         if not text:
             item["sentiment"] = {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0, "emoji": "⚪"}
             continue
         scores = _finbert_sentiment(text)
-        boost = _fin_keyword_boost(text)
-        compound = max(-1.0, min(1.0, scores["compound"] + boost))
-        if compound > 0.0:
+        compound = scores["compound"]
+        if compound > 0.1:
             emoji = "🟢"
-        elif compound < 0.0:
+        elif compound < -0.1:
             emoji = "🔴"
         else:
             emoji = "⚪"
@@ -300,26 +299,77 @@ def analyze_sentiment(headlines: list[dict]) -> list[dict]:
     return headlines
 
 def compute_sentiment_summary(headlines: list[dict]) -> dict:
-    """Compute an overall sentiment summary from a list of news dicts with sentiment scores.
+    """Compute overall sentiment with recency weighting and trend.
     
-    Returns: {"label": "Bullish"/"Bearish"/"Neutral", "emoji": "🟢"/"🔴"/"⚪", "avg_compound": float}
+    Returns: {"label": "...", "emoji": "...", "avg_compound": float, 
+              "weighted_compound": float, "trend": "improving"/"stable"/"deteriorating",
+              "trend_emoji": "↗️"/"➡️"/"↘️", "trend_label": "..."}
     """
-    compounds = []
+    from datetime import datetime
+    import math
+    
+    scored_items = []
+    now = datetime.now()
+    
     for item in headlines:
         s = item.get("sentiment", {})
         c = s.get("compound")
-        if c is not None:
-            compounds.append(c)
-    if not compounds:
-        return {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0}
-    avg = sum(compounds) / len(compounds)
-    if avg > 0.05:
+        if c is None:
+            continue
+        # Parse date for recency weight
+        date_str = item.get("date", "")
+        days_ago = 7  # default: week old
+        try:
+            dt = datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S %z")
+            days_ago = max(0, (now - dt.replace(tzinfo=None)).days)
+        except:
+            pass
+        # Exponential decay: weight = exp(-days/5) → half-life of ~3.5 days
+        weight = math.exp(-days_ago / 5.0)
+        scored_items.append({"compound": c, "days_ago": days_ago, "weight": weight})
+    
+    if not scored_items:
+        return {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0,
+                "weighted_compound": 0.0, "trend": "stable", "trend_emoji": "➡️", "trend_label": "Stable"}
+    
+    # Simple average
+    avg = sum(it["compound"] for it in scored_items) / len(scored_items)
+    
+    # Recency-weighted average
+    total_weight = sum(it["weight"] for it in scored_items)
+    weighted = sum(it["compound"] * it["weight"] for it in scored_items) / total_weight if total_weight > 0 else 0
+    
+    # Trend: compare recent half vs older half
+    scored_items.sort(key=lambda x: x["days_ago"])
+    mid = len(scored_items) // 2
+    if mid > 0:
+        recent_avg = sum(it["compound"] for it in scored_items[:mid]) / mid
+        older_avg = sum(it["compound"] for it in scored_items[mid:]) / (len(scored_items) - mid)
+        diff = recent_avg - older_avg
+        if diff > 0.05:
+            trend, trend_emoji, trend_label = "improving", "↗️", "Improving"
+        elif diff < -0.05:
+            trend, trend_emoji, trend_label = "deteriorating", "↘️", "Cooling"
+        else:
+            trend, trend_emoji, trend_label = "stable", "➡️", "Stable"
+    else:
+        trend, trend_emoji, trend_label = "stable", "➡️", "Stable"
+    
+    # Use weighted compound for classification (more reactive to breaking news)
+    score = weighted
+    if score > 0.1:
         label, emoji = "Bullish", "🟢"
-    elif avg < -0.05:
+    elif score < -0.1:
         label, emoji = "Bearish", "🔴"
     else:
         label, emoji = "Neutral", "⚪"
-    return {"label": label, "emoji": emoji, "avg_compound": round(avg, 4)}
+    
+    return {
+        "label": label, "emoji": emoji,
+        "avg_compound": round(avg, 4),
+        "weighted_compound": round(weighted, 4),
+        "trend": trend, "trend_emoji": trend_emoji, "trend_label": trend_label
+    }
 
 
 def get_news_and_ratings(ticker: str) -> dict:

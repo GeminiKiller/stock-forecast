@@ -396,3 +396,213 @@ if __name__ == "__main__":
     t = sys.argv[1] if len(sys.argv) > 1 else "NVDA"
     result = get_news_and_ratings(t)
     print(json.dumps(result, indent=2))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  FUNDAMENTALS + AI SCORE
+# ═══════════════════════════════════════════════════════════════
+
+# ── Fundamental metrics ──
+def get_fundamentals(ticker: str) -> dict:
+    """Fetch key fundamental metrics via yfinance."""
+    try:
+        import yfinance as yf
+        t = yf.Ticker(ticker)
+        info = t.info
+        
+        def _get(key, default=None):
+            return info.get(key, default)
+        
+        fundamentals = {
+            "available": True,
+            "pe_trailing": _get("trailingPE"),
+            "pe_forward": _get("forwardPE"),
+            "eps": _get("trailingEps"),
+            "eps_growth": _get("earningsGrowth"),
+            "revenue": _get("totalRevenue"),
+            "revenue_growth": _get("revenueGrowth"),
+            "profit_margin": _get("profitMargins"),
+            "debt_equity": _get("debtToEquity"),
+            "roe": _get("returnOnEquity"),
+            "roa": _get("returnOnAssets"),
+            "current_ratio": _get("currentRatio"),
+            "quick_ratio": _get("quickRatio"),
+            "dividend_yield": _get("dividendYield"),
+            "market_cap": _get("marketCap"),
+            "beta": _get("beta"),
+            "sector": _get("sector"),
+            "industry": _get("industry"),
+            "employees": _get("fullTimeEmployees"),
+        }
+        
+        def fmt_num(n):
+            if n is None: return None
+            if abs(n) >= 1e12: return f"{n/1e12:.2f}T"
+            if abs(n) >= 1e9: return f"{n/1e9:.2f}B"
+            if abs(n) >= 1e6: return f"{n/1e6:.2f}M"
+            return f"{n:.2f}"
+        
+        def fmt_pct(n):
+            if n is None: return None
+            return f"{n*100:.1f}%"
+        
+        fundamentals["revenue_fmt"] = fmt_num(fundamentals["revenue"])
+        fundamentals["market_cap_fmt"] = fmt_num(fundamentals["market_cap"])
+        fundamentals["profit_margin_fmt"] = fmt_pct(fundamentals["profit_margin"])
+        fundamentals["revenue_growth_fmt"] = fmt_pct(fundamentals["revenue_growth"])
+        fundamentals["eps_growth_fmt"] = fmt_pct(fundamentals["eps_growth"])
+        fundamentals["dividend_yield_fmt"] = fmt_pct(fundamentals["dividend_yield"])
+        fundamentals["roe_fmt"] = fmt_pct(fundamentals["roe"])
+        fundamentals["roa_fmt"] = fmt_pct(fundamentals["roa"])
+        
+        return fundamentals
+    except Exception as e:
+        return {"available": False, "message": str(e)}
+
+
+# ── AI Score (0-100) ──
+def compute_ai_score(price_data: dict, tech: dict, sentiment: dict, analyst: dict) -> dict:
+    """Compute overall AI score (0-100) from all signals.
+    
+    Weights: Technical 30%, Sentiment 25%, Analyst 25%, Momentum 20%
+    """
+    score = 0
+    max_score = 0
+    details = {}
+    
+    # 1. Technical Score (30 pts)
+    tech_score = 0
+    tech_max = 30
+    
+    # RSI: 50=center, <30=oversold (+), >70=overbought (-)
+    rsi = tech.get("rsi")
+    if rsi is not None:
+        if rsi <= 30:
+            rsi_pts = 10
+        elif rsi >= 70:
+            rsi_pts = 0
+        else:
+            rsi_pts = max(0, 10 - abs(rsi - 50) / 2)
+        tech_score += rsi_pts
+        details["rsi"] = round(rsi_pts, 1)
+    
+    # EMA trend
+    ema_label = tech.get("ema_label")
+    if ema_label == "BULLISH":
+        tech_score += 10
+        details["ema"] = 10
+    elif ema_label == "BEARISH":
+        details["ema"] = 0
+    else:
+        details["ema"] = 5
+        tech_score += 5
+    
+    # TD Sequential
+    td_count = tech.get("td_count", 0)
+    if td_count >= 1 and td_count <= 4:
+        td_pts = 5
+    elif td_count >= 5 and td_count <= 8:
+        td_pts = 7
+    elif td_count >= 9:
+        td_pts = 10
+    else:
+        td_pts = 5
+    tech_score += td_pts
+    details["td"] = td_pts
+    
+    score += tech_score
+    max_score += tech_max
+    details["technical"] = round(tech_score, 1)
+    
+    # 2. Sentiment Score (25 pts)
+    sent_score = 0
+    sent_max = 25
+    compound = sentiment.get("compound", 0)
+    sent_score = ((compound + 1) / 2) * 25
+    score += sent_score
+    max_score += sent_max
+    details["sentiment"] = round(sent_score, 1)
+    
+    # 3. Analyst Score (25 pts)
+    analyst_score = 0
+    analyst_max = 25
+    
+    if analyst.get("available"):
+        rec = analyst.get("recommendation", "")
+        rec_map = {
+            "strong_buy": 25, "buy": 20, "hold": 12, "sell": 5, "strong_sell": 0
+        }
+        analyst_score = rec_map.get(rec, 12)
+    else:
+        analyst_score = 12
+    
+    score += analyst_score
+    max_score += analyst_max
+    details["analyst"] = round(analyst_score, 1)
+    
+    # 4. Momentum Score (20 pts)
+    mom_score = 0
+    mom_max = 20
+    
+    # Price momentum vs 52wk range
+    high = tech.get("52wk_high")
+    low = tech.get("52wk_low")
+    current = tech.get("current_price")
+    if high and low and current and high > low:
+        pct = (current - low) / (high - low)
+        if pct >= 0.6 and pct <= 0.8:
+            mom_pts = 15
+        elif pct > 0.8:
+            mom_pts = 10
+        elif pct >= 0.4:
+            mom_pts = 10
+        else:
+            mom_pts = 5
+        mom_score += mom_pts
+    else:
+        mom_score += 10
+    
+    # Volume momentum
+    vol_label = tech.get("vol_label", "")
+    if vol_label.startswith("Above avg"):
+        mom_score += 5
+    elif vol_label.startswith("Below avg"):
+        mom_score += 2
+    else:
+        mom_score += 3
+    
+    score += mom_score
+    max_score += mom_max
+    details["momentum"] = round(mom_score, 1)
+    
+    # Normalize to 0-100
+    if max_score > 0:
+        final_score = (score / max_score) * 100
+    else:
+        final_score = 50
+    
+    final_score = max(0, min(100, final_score))
+    
+    if final_score >= 80:
+        label, emoji = "Strong Buy", "🟢"
+    elif final_score >= 60:
+        label, emoji = "Buy", "🟢"
+    elif final_score >= 40:
+        label, emoji = "Hold", "⚪"
+    elif final_score >= 20:
+        label, emoji = "Sell", "🔴"
+    else:
+        label, emoji = "Strong Sell", "🔴"
+    
+    return {
+        "score": round(final_score, 1),
+        "label": label,
+        "emoji": emoji,
+        "details": details,
+        "components": {
+            "technical": round((details["technical"] / tech_max) * 100, 1) if tech_max > 0 else 0,
+            "sentiment": round((details["sentiment"] / sent_max) * 100, 1) if sent_max > 0 else 0,
+            "analyst": round((details["analyst"] / analyst_max) * 100, 1) if analyst_max > 0 else 0,
+            "momentum": round((details["momentum"] / mom_max) * 100, 1) if mom_max > 0 else 0,
+        }
+    }

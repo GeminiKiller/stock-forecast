@@ -632,17 +632,31 @@ def api_preview(ticker):
 
         # Also fetch news + sentiment for this ticker
         try:
-            from news import get_news_and_ratings
+            from news import get_news_and_ratings, get_fundamentals, compute_ai_score
             nd = get_news_and_ratings(ticker)
             news = nd.get("news", [])[:10]
-            sentiment_summary = nd.get("sentiment_summary", {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0})
+            sentiment_summary = nd.get("sentiment_summary", {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0, "compound": 0.0})
             analyst = nd.get("analyst", {"available": False})
             earnings = nd.get("earnings", {"available": False})
+            fundamentals = get_fundamentals(ticker)
         except:
             news = []
-            sentiment_summary = {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0}
+            sentiment_summary = {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0, "compound": 0.0}
             analyst = {"available": False}
             earnings = {"available": False}
+            fundamentals = {"available": False}
+
+        # Compute AI Score
+        tech_data = {
+            "rsi": rsi_val,
+            "ema_label": ema_label,
+            "td_count": td_count,
+            "52wk_high": wk52_high,
+            "52wk_low": wk52_low,
+            "current_price": current_price,
+            "vol_label": vol_label,
+        }
+        ai_score = compute_ai_score({}, tech_data, sentiment_summary, analyst)
 
         return jsonify({
             "ticker": ticker,
@@ -662,6 +676,8 @@ def api_preview(ticker):
             "sentiment_summary": sentiment_summary,
             "analyst": analyst,
             "earnings": earnings,
+            "fundamentals": fundamentals,
+            "ai_score": ai_score,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -704,6 +720,78 @@ def api_chart_ready(chart_name):
 @app.route("/test")
 def test():
     return send_file(WORKSPACE / "gui" / "test_standalone.html")
+
+
+# ── Chart Data (for Chart.js browser rendering) ──
+@app.route("/api/chart-data/<ticker>")
+def api_chart_data(ticker):
+    """Return OHLC + indicator data as JSON for Chart.js browser rendering."""
+    ticker = ticker.upper()
+    try:
+        import yfinance as yf
+        import numpy as np
+
+        data_range = request.args.get("data_range", "3m").lower()
+        range_map = {"3m": "3mo", "6m": "6mo", "1y": "1y", "2y": "2y", "5y": "5y", "max": "max"}
+        period = range_map.get(data_range, "3mo")
+
+        raw = yf.download([ticker], period=period, auto_adjust=True, progress=False)
+        if len(raw) == 0:
+            return jsonify({"error": "No data found"}), 404
+
+        # Build OHLC array
+        close_col = ('Close', ticker) if ('Close', ticker) in raw.columns else 'Close'
+        open_col = ('Open', ticker) if ('Open', ticker) in raw.columns else 'Open'
+        high_col = ('High', ticker) if ('High', ticker) in raw.columns else 'High'
+        low_col = ('Low', ticker) if ('Low', ticker) in raw.columns else 'Low'
+
+        ohlc = []
+        for idx in raw.index:
+            ohlc.append({
+                "x": idx.strftime("%Y-%m-%d"),
+                "o": float(raw[open_col].loc[idx]),
+                "h": float(raw[high_col].loc[idx]),
+                "l": float(raw[low_col].loc[idx]),
+                "c": float(raw[close_col].loc[idx]),
+            })
+
+        # Compute indicators
+        close_series = raw[close_col].squeeze()
+        def compute_rsi(series, length=14):
+            delta = series.diff()
+            gain = delta.where(delta > 0, 0.0).rolling(window=length).mean()
+            loss = (-delta.where(delta < 0, 0.0)).rolling(window=length).mean()
+            rs = gain / loss
+            return 100.0 - (100.0 / (1.0 + rs))
+
+        def compute_ema(series, length=50):
+            return series.ewm(span=length, adjust=False).mean()
+
+        def compute_bbands(series, length=20, std=2.0):
+            sma = series.rolling(window=length).mean()
+            rstd = series.rolling(window=length).std()
+            return sma + rstd * std, sma, sma - rstd * std
+
+        rsi = compute_rsi(close_series, 14)
+        ema50 = compute_ema(close_series, 50)
+        bb_upper, bb_mid, bb_lower = compute_bbands(close_series, 20, 2.0)
+
+        # Build indicator arrays (aligned with OHLC dates)
+        indicators = {"rsi": [], "ema_50": [], "bb_upper": [], "bb_lower": [], "bb_mid": []}
+        for idx in raw.index:
+            indicators["rsi"].append({"x": idx.strftime("%Y-%m-%d"), "y": round(float(rsi.loc[idx]), 2) if not pd.isna(rsi.loc[idx]) else None})
+            indicators["ema_50"].append({"x": idx.strftime("%Y-%m-%d"), "y": round(float(ema50.loc[idx]), 2) if not pd.isna(ema50.loc[idx]) else None})
+            indicators["bb_upper"].append({"x": idx.strftime("%Y-%m-%d"), "y": round(float(bb_upper.loc[idx]), 2) if not pd.isna(bb_upper.loc[idx]) else None})
+            indicators["bb_lower"].append({"x": idx.strftime("%Y-%m-%d"), "y": round(float(bb_lower.loc[idx]), 2) if not pd.isna(bb_lower.loc[idx]) else None})
+            indicators["bb_mid"].append({"x": idx.strftime("%Y-%m-%d"), "y": round(float(bb_mid.loc[idx]), 2) if not pd.isna(bb_mid.loc[idx]) else None})
+
+        return jsonify({
+            "ticker": ticker,
+            "ohlc": ohlc,
+            "indicators": indicators,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ── HTML (dark cyberpunk theme, WebSocket-based) ──────────────
@@ -782,15 +870,31 @@ h1 span{color:#ff6b35}
 .preview-item .pv.down{color:#ff4444}
 .sentiment-counts{font-size:11px;color:#666;margin:4px 0;display:flex;gap:12px}
 .sentiment-counts span{display:flex;align-items:center;gap:4px}
-.trend-indicator{font-size:11px;margin-left:4px}
+.watch-btn{position:absolute;right:8px;top:32px;background:none;border:none;color:#888;cursor:pointer;font-size:16px;padding:4px}
+.watch-btn.active{color:#ffd700}
+.watchlist-bar{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;justify-content:center;min-height:28px}
+.watch-chip{font-size:11px;background:#1a1a1a;border:1px solid #333;padding:4px 10px;border-radius:3px;cursor:pointer;color:#ccc;display:flex;align-items:center;gap:6px}
+.watch-chip:hover{background:#222}
+.watch-chip .x{color:#666;font-size:10px;margin-left:2px}
+.watch-chip .x:hover{color:#ff4444}
 .trend-improving{color:#00ff88}
 .trend-stable{color:#888}
 .trend-deteriorating{color:#ff4444}
+.ai-score-big{font-size:20px;font-weight:700;margin:8px 0}
+.ai-score-big .score-num{font-size:28px}
+.ai-components{display:flex;gap:8px;font-size:10px;color:#888;margin:4px 0}
+.ai-components span{padding:2px 6px;background:#1a1a1a;border-radius:2px}
+.fund-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px 12px;font-size:11px;margin:8px 0}
+.fund-item{display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px solid #1a1a1a}
+.fund-item .fk{color:#666}.fund-item .fv{color:#ccc;font-weight:500}
 .sentiment-summary{font-size:12px;margin-bottom:8px;padding:6px 0;border-bottom:1px solid #1a1a1a}
 .sentiment-summary .ss-label{font-weight:700}
 .sentiment-summary .ss-bullish{color:#00ff88}.sentiment-summary .ss-bearish{color:#ff4444}.sentiment-summary .ss-neutral{color:#888}
 </style>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.2.1/dist/chartjs-chart-financial.min.js"></script>
 </head><body>
 <div class="container">
   <h1>⚡ <span>Forecast</span> <span style="font-size:10px;color:#444">v2</span></h1>
@@ -799,7 +903,7 @@ h1 span{color:#ff6b35}
   <div id="wsStatus" class="ws-status disconnected">⬤ offline</div>
 
   <div class="form">
-    <div class="field autocomplete-wrapper"><label>Target</label><input id="target" placeholder="e.g. APLD" value="APLD" autocomplete="off"><div id="targetAC" class="autocomplete-list"></div></div>
+    <div class="field autocomplete-wrapper"><label>Target</label><input id="target" placeholder="e.g. APLD" value="APLD" autocomplete="off"><div id="targetAC" class="autocomplete-list"></div><button id="watchBtn" class="watch-btn" title="Add to watchlist" onclick="toggleWatch()">⭐</button></div>
     <div class="field autocomplete-wrapper"><label>Helper</label><input id="helper" placeholder="e.g. NVDA" value="NVDA" autocomplete="off"><div id="helperAC" class="autocomplete-list"></div></div>
     <div class="field"><label>Horizon</label><select id="horizon"><option value="5">5d</option><option value="12" selected>12d</option><option value="20">20d</option><option value="30">30d</option></select></div>
     <div class="field"><label>Data Range</label><select id="dataRange" onchange="checkResources()"><option value="3m" selected>3mo</option><option value="6m">6mo</option><option value="1y">1yr ⚠️</option><option value="2y">2yr ⚠️</option><option value="5y">5yr 🔴</option><option value="max">Max 🔴</option></select></div>
@@ -809,6 +913,9 @@ h1 span{color:#ff6b35}
   <div class="chart-toggle">
     <button id="btnCandle" class="active" onclick="setChartType('candle')">🕯 Candlestick</button>
     <button id="btnLine" onclick="setChartType('line')">📈 Line</button>
+    <span style="margin:0 8px;color:#333">|</span>
+    <button id="btnBrowser" onclick="setRenderMode('browser')">⚡ Browser</button>
+    <button id="btnServer" onclick="setRenderMode('server')">📷 Server</button>
   </div>
 
   <div id="helpPanel" style="display:none;background:#111;border:1px solid #333;border-radius:2px;padding:16px;margin-bottom:16px;font-size:12px;line-height:1.6">
@@ -839,6 +946,7 @@ h1 span{color:#ff6b35}
     <label><input type="checkbox" id="oC" checked onchange="checkResources()"> Chronos-2</label>
     <label><input type="checkbox" id="oL" onchange="checkResources()"> LSTM</label>
   </div>
+  <div id="watchlistBar" class="watchlist-bar"></div>
 
   <div id="cacheInfo" class="cache-status"></div>
 
@@ -852,7 +960,7 @@ h1 span{color:#ff6b35}
   <div id="warnBox" style="display:none;text-align:center;padding:6px;color:#ff6b35;font-size:11px"></div>
 
   <div class="results" id="res">
-    <div class="chart-box"><img id="chart" src=""></div>
+    <div class="chart-box"><img id="chart" src=""><canvas id="chartCanvas" style="display:none;width:100%;height:480px;background:#0c0c0c"></canvas></div>
     <div class="cards">
       <div class="card"><h3>Predictions</h3><div id="pBody"></div></div>
       <div class="card"><h3>Technicals</h3><div id="tBody"></div></div>
@@ -968,6 +1076,91 @@ function checkResources(){
   w.style.display=msgs.length?'block':'none';
 }
 function setChartType(t){chartType=t;document.getElementById('btnCandle').className=t==='candle'?'active':'';document.getElementById('btnLine').className=t==='line'?'active':'';if(document.getElementById('res').classList.contains('active'))run()}
+
+// ── Chart.js Browser Render ──
+var _renderMode='server';
+var _chartJSInstance=null;
+var _chartData=null;
+function setRenderMode(m){
+  _renderMode=m;
+  document.getElementById('btnBrowser').className=m==='browser'?'active':'';
+  document.getElementById('btnServer').className=m==='server'?'active':'';
+  var img=document.getElementById('chart');
+  var canvas=document.getElementById('chartCanvas');
+  if(m==='browser'){
+    img.style.display='none';
+    canvas.style.display='block';
+    var t=val('target');
+    if(t) fetchChartData(t);
+  }else{
+    img.style.display='block';
+    canvas.style.display='none';
+    destroyChartJS();
+  }
+}
+function destroyChartJS(){
+  if(_chartJSInstance){ _chartJSInstance.destroy(); _chartJSInstance=null; }
+}
+function fetchChartData(ticker){
+  fetch('/api/chart-data/'+encodeURIComponent(ticker)+'?data_range='+encodeURIComponent(val('dataRange'))).then(function(r){return r.json()}).then(function(d){
+    if(d.error){ console.error('chart data error:', d.error); return; }
+    _chartData=d;
+    renderChartJS(d);
+  }).catch(function(e){ console.error('fetch chart data failed:', e); });
+}
+function renderChartJS(data){
+  destroyChartJS();
+  var ctx=document.getElementById('chartCanvas').getContext('2d');
+  var ohlc=data.ohlc||[];
+  if(ohlc.length===0) return;
+  var closeData=ohlc.map(function(p){return {x:p.x,y:p.c};});
+  var ema50=(data.indicators&&data.indicators.ema_50)?data.indicators.ema_50.filter(function(p){return p.y!==null;}):[];
+  var datasets=[{
+    label:'Close',data:closeData,borderColor:'#00ff88',backgroundColor:'rgba(0,255,136,0.05)',
+    borderWidth:1.5,pointRadius:0,fill:true,tension:0.1
+  }];
+  if(ema50.length>0){
+    datasets.push({label:'EMA 50',data:ema50,borderColor:'#ff6b35',borderWidth:1,pointRadius:0,fill:false,tension:0.1});
+  }
+  _chartJSInstance=new Chart(ctx,{
+    type:'line',
+    data:{datasets:datasets},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{
+        legend:{labels:{color:'#888',font:{size:10}}},
+        tooltip:{mode:'index',intersect:false,backgroundColor:'#1a1a1a',titleColor:'#00ff88',bodyColor:'#c0c0c0',borderColor:'#333',borderWidth:1}
+      },
+      scales:{
+        x:{type:'category',ticks:{color:'#555',maxRotation:0,autoSkip:true,maxTicksLimit:10},grid:{color:'#1a1a1a'}},
+        y:{position:'right',ticks:{color:'#555'},grid:{color:'#1a1a1a'}}
+      }
+    }
+  });
+}
+function overlayPredictionsOnChart(predictions){
+  if(!_chartJSInstance || _renderMode!=='browser') return;
+  // Remove existing prediction datasets (label starts with 'Pred')
+  var ds=_chartJSInstance.data.datasets;
+  for(var i=ds.length-1;i>=0;i--){ if(ds[i].label.startsWith('Pred')) ds.splice(i,1); }
+  // Add new prediction datasets
+  var colors={'Chronos-2':'#00aaff','Neural LSTM':'#ff00ff','TimesFM 2.5':'#ffcc00','Ensemble':'#ffffff'};
+  predictions.forEach(function(p){
+    var color=colors[p.model]||'#888';
+    ds.push({
+      label:'Pred '+p.model,
+      data:p.dates.map(function(d,i){return {x:d,y:p.values[i]};}),
+      borderColor:color,borderWidth:2,pointRadius:3,fill:false,tension:0.1,borderDash:[5,5]
+    });
+  });
+  _chartJSInstance.update();
+}
+function clearPredictionsFromChart(){
+  if(!_chartJSInstance) return;
+  var ds=_chartJSInstance.data.datasets;
+  for(var i=ds.length-1;i>=0;i--){ if(ds[i].label.startsWith('Pred')) ds.splice(i,1); }
+  _chartJSInstance.update();
+}
 function escHtml(s){if(!s)return '';var d=document.createElement('div');d.appendChild(document.createTextNode(s));return d.innerHTML}
 
 function $(id){return document.getElementById(id)}
@@ -1105,7 +1298,22 @@ function loadPreview(ticker){
   content.innerHTML='<div class="preview-item" style="color:#888"><span class="spinner"></span> loading '+escHtml(ticker)+'...</div>';
   fetch('/api/preview/'+encodeURIComponent(ticker)+'?data_range='+encodeURIComponent(val('dataRange'))).then(function(r){return r.json()}).then(function(d){
     if(d.error){content.innerHTML='<div class="preview-item" style="color:#ff4444">'+escHtml(d.error)+'</div>';return;}
-    var h='<div class="preview-grid">';
+    var h='';
+    // AI Score (prominent)
+    if(d.ai_score){
+      var ai=d.ai_score;
+      var aiCls=ai.label==='Strong Buy'||ai.label==='Buy'?'ss-bullish':ai.label==='Strong Sell'||ai.label==='Sell'?'ss-bearish':'ss-neutral';
+      h+='<div class="ai-score-big"><span class="ss-label '+aiCls+'">'+escHtml(ai.emoji)+' '+escHtml(ai.label)+' <span class="score-num">'+escHtml(String(ai.score))+'</span></span></div>';
+      if(ai.components){
+        h+='<div class="ai-components">';
+        h+='<span>Tech '+escHtml(String(ai.components.technical))+'</span>';
+        h+='<span>Sent '+escHtml(String(ai.components.sentiment))+'</span>';
+        h+='<span>Analyst '+escHtml(String(ai.components.analyst))+'</span>';
+        h+='<span>Mom '+escHtml(String(ai.components.momentum))+'</span>';
+        h+='</div>';
+      }
+    }
+    h+='<div class="preview-grid">';
     h+='<div class="preview-item"><span class="pk">Price</span><span class="pv'+(d.current_price?'':'')+'">'+(d.current_price?'$'+d.current_price:'—')+'</span></div>';
     h+='<div class="preview-item"><span class="pk">RSI 14</span><span class="pv">'+(d.rsi!=null?d.rsi.toFixed(1):'—')+' '+(d.rsi_label||'')+'</span></div>';
     h+='<div class="preview-item"><span class="pk">EMA 50</span><span class="pv '+(d.ema_label==='BEARISH'?'down':'')+'">'+(d.ema_label||'—')+' '+(d.ema_50!=null?'$'+d.ema_50:'')+'</span></div>';
@@ -1124,7 +1332,23 @@ function loadPreview(ticker){
       }
       h+='<div class="sentiment-summary" style="margin-top:8px">Sentiment: <span class="ss-label '+cls+'">'+escHtml(ss.emoji)+' '+escHtml(ss.label)+' ('+escHtml(String(ss.avg_compound))+')</span>'+trendHtml2+'</div>';
     }
+    // Fundamentals
+    if(d.fundamentals && d.fundamentals.available){
+      var f=d.fundamentals;
+      h+='<div style="font-size:11px;color:#888;margin:8px 0 4px;border-bottom:1px solid #1a1a1a;padding-bottom:4px">Fundamentals</div>';
+      h+='<div class="fund-grid">';
+      if(f.pe_trailing) h+='<div class="fund-item"><span class="fk">P/E</span><span class="fv">'+escHtml(String(f.pe_trailing.toFixed(2)))+'</span></div>';
+      if(f.pe_forward) h+='<div class="fund-item"><span class="fk">Fwd P/E</span><span class="fv">'+escHtml(String(f.pe_forward.toFixed(2)))+'</span></div>';
+      if(f.eps) h+='<div class="fund-item"><span class="fk">EPS</span><span class="fv">$'+escHtml(String(f.eps))+'</span></div>';
+      if(f.market_cap_fmt) h+='<div class="fund-item"><span class="fk">Mkt Cap</span><span class="fv">'+escHtml(f.market_cap_fmt)+'</span></div>';
+      if(f.revenue_fmt) h+='<div class="fund-item"><span class="fk">Revenue</span><span class="fv">'+escHtml(f.revenue_fmt)+'</span></div>';
+      if(f.profit_margin_fmt) h+='<div class="fund-item"><span class="fk">Margin</span><span class="fv">'+escHtml(f.profit_margin_fmt)+'</span></div>';
+      if(f.revenue_growth_fmt) h+='<div class="fund-item"><span class="fk">Rev Growth</span><span class="fv">'+escHtml(f.revenue_growth_fmt)+'</span></div>';
+      if(f.beta) h+='<div class="fund-item"><span class="fk">Beta</span><span class="fv">'+escHtml(String(f.beta.toFixed(2)))+'</span></div>';
+      h+='</div>';
+    }
     content.innerHTML=h;
+    syncWatchBtn(ticker);
   }).catch(function(e){content.innerHTML='<div class="preview-item" style="color:#ff4444">preview failed</div>';});
 }
 
@@ -1136,6 +1360,56 @@ function onTargetChange(){
   }else{
     document.getElementById('previewPanel').classList.remove('active');
   }
+}
+
+
+
+// ── Watchlist ──
+var _watchlist=[];
+function loadWatchlist(){
+  try{ _watchlist=JSON.parse(localStorage.getItem('watchlist')||'[]'); }catch(e){ _watchlist=[]; }
+  renderWatchlist();
+}
+function saveWatchlist(){ localStorage.setItem('watchlist',JSON.stringify(_watchlist)); renderWatchlist(); }
+function isWatched(t){ return _watchlist.indexOf(t.toUpperCase())>=0; }
+function addToWatchlist(t){
+  t=t.toUpperCase();
+  if(_watchlist.indexOf(t)<0){ _watchlist.push(t); saveWatchlist(); }
+}
+function removeFromWatchlist(t){
+  t=t.toUpperCase();
+  var i=_watchlist.indexOf(t);
+  if(i>=0){ _watchlist.splice(i,1); saveWatchlist(); }
+}
+function toggleWatch(){
+  var t=val('target');
+  if(!t)return;
+  if(isWatched(t)){ removeFromWatchlist(t); }else{ addToWatchlist(t); }
+  syncWatchBtn(t);
+}
+function syncWatchBtn(t){
+  var btn=document.getElementById('watchBtn');
+  if(!btn)return;
+  if(isWatched(t)){ btn.classList.add('active'); btn.title='Remove from watchlist'; }
+  else{ btn.classList.remove('active'); btn.title='Add to watchlist'; }
+}
+function renderWatchlist(){
+  var bar=document.getElementById('watchlistBar');
+  if(!bar)return;
+  bar.innerHTML='';
+  if(_watchlist.length===0)return;
+  _watchlist.forEach(function(t){
+    var chip=document.createElement('div');
+    chip.className='watch-chip';
+    chip.textContent=t;
+    chip.onclick=function(){ document.getElementById('target').value=t; onTargetChange(); };
+    var x=document.createElement('span');
+    x.className='x';
+    x.textContent='✕';
+    x.onclick=function(e){ e.stopPropagation(); removeFromWatchlist(t); syncWatchBtn(val('target')); };
+    chip.appendChild(x);
+    bar.appendChild(chip);
+  });
 }
 
 // ── Autocomplete ──
@@ -1195,6 +1469,10 @@ function setupAutocomplete(inputId, listId){
 
 setupAutocomplete('target','targetAC');
 setupAutocomplete('helper','helperAC');
+loadWatchlist();
+// Trigger preview on load if target has value
+var _initialTarget=val('target');
+if(_initialTarget){ loadPreview(_initialTarget); }
 
 // Bind target input change for preview
 document.getElementById('target').addEventListener('change', onTargetChange);

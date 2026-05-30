@@ -976,6 +976,7 @@ function checkResources(){
   w.style.display=msgs.length?'block':'none';
 }
 function setChartType(t){chartType=t;document.getElementById('btnCandle').className=t==='candle'?'active':'';document.getElementById('btnLine').className=t==='line'?'active':'';if(document.getElementById('res').classList.contains('active'))run()}
+function escHtml(s){if(!s)return '';var d=document.createElement('div');d.appendChild(document.createTextNode(s));return d.innerHTML}
 
 function $(id){return document.getElementById(id)}
 function val(id){return $(id).value.trim().toUpperCase()}

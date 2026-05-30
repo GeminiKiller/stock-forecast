@@ -11,6 +11,43 @@ try:
 except ImportError:
     _sid = None
 
+# FinBERT (PyTorch) — much better financial sentiment
+try:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    _finbert_tokenizer = None
+    _finbert_model = None
+    _finbert_available = True
+except ImportError:
+    _finbert_available = False
+
+def _get_finbert():
+    global _finbert_tokenizer, _finbert_model
+    if _finbert_model is not None:
+        return _finbert_tokenizer, _finbert_model
+    _finbert_tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+    _finbert_model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+    _finbert_model.eval()
+    return _finbert_tokenizer, _finbert_model
+
+def _finbert_sentiment(text):
+    tokenizer, model = _get_finbert()
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        probs = torch.softmax(outputs.logits, dim=1)[0]
+    # FinBERT labels: 0=positive, 1=negative, 2=neutral
+    pos = probs[0].item()
+    neg = probs[1].item()
+    neu = probs[2].item()
+    compound = pos - neg
+    return {
+        "compound": round(compound, 4),
+        "pos": round(pos, 4),
+        "neu": round(neu, 4),
+        "neg": round(neg, 4),
+    }
+
 
 def fetch_yahoo_rss(ticker: str, max_items: int = 15) -> list[dict]:
     """Fetch latest news from Yahoo Finance RSS feed."""
@@ -210,37 +247,57 @@ def _fin_keyword_boost(text: str) -> float:
     return max(-0.5, min(0.5, boost))  # clamp boost to ±0.5
 
 def analyze_sentiment(headlines: list[dict]) -> list[dict]:
-    """Add VADER + financial keyword boosted sentiment scores to each headline.
+    """Add FinBERT sentiment scores to each headline (VADER fallback if unavailable).
     
     Adds: sentiment.compound, sentiment.pos, sentiment.neu, sentiment.neg, sentiment.emoji
     Returns the same list with sentiment field added to each dict.
     """
-    if _sid is None:
+    if not _finbert_available:
+        # Fallback to keyword-boosted VADER
+        if _sid is None:
+            for item in headlines:
+                item["sentiment"] = {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0, "emoji": "⚪"}
+            return headlines
+        for item in headlines:
+            text = item.get("title", "") or ""
+            if not text:
+                item["sentiment"] = {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0, "emoji": "⚪"}
+                continue
+            scores = _sid.polarity_scores(text)
+            boost = _fin_keyword_boost(text)
+            compound = max(-1.0, min(1.0, scores["compound"] + boost))
+            if compound > 0.0:
+                emoji = "🟢"
+            elif compound < 0.0:
+                emoji = "🔴"
+            else:
+                emoji = "⚪"
+            item["sentiment"] = {
+                "compound": round(compound, 4),
+                "pos": round(scores["pos"], 4),
+                "neu": round(scores["neu"], 4),
+                "neg": round(scores["neg"], 4),
+                "emoji": emoji,
+            }
         return headlines
+    
+    # FinBERT + keyword boost hybrid
     for item in headlines:
         text = item.get("title", "") or ""
         if not text:
             item["sentiment"] = {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0, "emoji": "⚪"}
             continue
-        scores = _sid.polarity_scores(text)
+        scores = _finbert_sentiment(text)
         boost = _fin_keyword_boost(text)
         compound = max(-1.0, min(1.0, scores["compound"] + boost))
-        # Use 0.0 threshold for financial news (more sensitive than VADER's 0.05)
         if compound > 0.0:
             emoji = "🟢"
         elif compound < 0.0:
             emoji = "🔴"
         else:
             emoji = "⚪"
-        item["sentiment"] = {
-            "compound": round(compound, 4),
-            "pos": round(scores["pos"], 4),
-            "neu": round(scores["neu"], 4),
-            "neg": round(scores["neg"], 4),
-            "emoji": emoji,
-        }
+        item["sentiment"] = {**scores, "emoji": emoji}
     return headlines
-
 
 def compute_sentiment_summary(headlines: list[dict]) -> dict:
     """Compute an overall sentiment summary from a list of news dicts with sentiment scores.

@@ -780,8 +780,8 @@ h1 span{color:#ff6b35}
 .preview-item{font-size:12px;display:flex;justify-content:space-between;padding:2px 0}
 .preview-item .pk{color:#555}.preview-item .pv{color:#00ff88;font-weight:600}
 .preview-item .pv.down{color:#ff4444}
-.sentiment-bar{display:flex;height:14px;border-radius:2px;overflow:hidden;margin:6px 0}
-.sentiment-bar .sb-pos{background:#00ff88}.sentiment-bar .sb-neu{background:#444}.sentiment-bar .sb-neg{background:#ff4444}
+.sentiment-counts{font-size:11px;color:#666;margin:4px 0;display:flex;gap:12px}
+.sentiment-counts span{display:flex;align-items:center;gap:4px}
 .sentiment-summary{font-size:12px;margin-bottom:8px;padding:6px 0;border-bottom:1px solid #1a1a1a}
 .sentiment-summary .ss-label{font-weight:700}
 .sentiment-summary .ss-bullish{color:#00ff88}.sentiment-summary .ss-bearish{color:#ff4444}.sentiment-summary .ss-neutral{color:#888}
@@ -1056,16 +1056,25 @@ function showNews(d){
   if(ss){
     var cls = ss.label==='Bullish'?'ss-bullish':ss.label==='Bearish'?'ss-bearish':'ss-neutral';
     nh+='<div class="sentiment-summary">News sentiment: <span class="ss-label '+cls+'">'+escHtml(ss.emoji)+' '+escHtml(ss.label)+' ('+escHtml(String(ss.avg_compound))+')</span></div>';
-    // Collect average sentiment for bar
+    // Count emoji sentiments
     var items = d.news||[];
     if(items.length>0){
-      var avgPos=0, avgNeu=0, avgNeg=0, cnt=0;
+      var bullish=0, bearish=0, neutral=0;
       items.forEach(function(n){
         var s=n.sentiment;
-        if(s){avgPos+=s.pos||0;avgNeu+=s.neu||0;avgNeg+=s.neg||0;cnt++;}
+        if(s){
+          if(s.emoji==='🟢') bullish++;
+          else if(s.emoji==='🔴') bearish++;
+          else neutral++;
+        }
       });
-      if(cnt>0){avgPos/=cnt;avgNeu/=cnt;avgNeg/=cnt;var tot=avgPos+avgNeu+avgNeg||1;
-        nh+='<div class="sentiment-bar"><div class="sb-pos" style="width:'+(avgPos/tot*100).toFixed(1)+'%"></div><div class="sb-neu" style="width:'+(avgNeu/tot*100).toFixed(1)+'%"></div><div class="sb-neg" style="width:'+(avgNeg/tot*100).toFixed(1)+'%"></div></div>';
+      if(bullish+bearish+neutral>0){
+        var countsHtml='<div class="sentiment-counts">';
+        if(bullish>0) countsHtml+='<span>🟢 '+bullish+'</span>';
+        if(neutral>0) countsHtml+='<span>⚪ '+neutral+'</span>';
+        if(bearish>0) countsHtml+='<span>🔴 '+bearish+'</span>';
+        countsHtml+='\u003c/div\u003e';
+        nh+=countsHtml;
       }
     }
   }

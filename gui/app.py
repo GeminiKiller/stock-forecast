@@ -394,6 +394,7 @@ def _job_lifecycle(jid):
     result = {
         "target": job["target"],
         "helper": job["helper"],
+        "horizon": job.get("horizon", 12),
         "predictions": [],
         "consensus": "N/A",
         "avg_delta": 0,
@@ -472,6 +473,22 @@ def _job_lifecycle(jid):
         result["analyst"] = {"available": False}
         result["earnings"] = {"available": False}
         result["sentiment_summary"] = {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0}
+
+    # Compute AI Score for the result
+    try:
+        from news import compute_ai_score
+        tech_for_ai = {
+            "rsi": metadata.get("rsi"),
+            "ema_label": metadata.get("ema_label", ""),
+            "td_count": metadata.get("td_count", 0),
+            "52wk_high": metadata.get("52wk_high"),
+            "52wk_low": metadata.get("52wk_low"),
+            "current_price": current_price,
+            "vol_label": metadata.get("vol_label", ""),
+        }
+        result["ai_score"] = compute_ai_score({}, tech_for_ai, result.get("sentiment_summary", {}), result.get("analyst", {"available": False}))
+    except Exception:
+        result["ai_score"] = None
 
     # Clean up
     with _jobs_lock:
@@ -886,8 +903,8 @@ h1 span{color:#ff6b35}
     <button id="btnCandle" class="active" onclick="setChartType('candle')">🕯 Candlestick</button>
     <button id="btnLine" onclick="setChartType('line')">📈 Line</button>
     <span style="margin:0 8px;color:#333">|</span>
-    <button id="btnBrowser" onclick="setRenderMode('browser')">⚡ Browser</button>
-    <button id="btnServer" onclick="setRenderMode('server')">📷 Server</button>
+    <button id="btnBrowser" onclick="setRenderMode('browser')">📊 Interactive</button>
+    <button id="btnServer" onclick="setRenderMode('server')">🖼 Static</button>
   </div>
 
   <div id="helpPanel" style="display:none;background:#111;border:1px solid #333;border-radius:2px;padding:16px;margin-bottom:16px;font-size:12px;line-height:1.6">
@@ -932,6 +949,7 @@ h1 span{color:#ff6b35}
   <div id="warnBox" style="display:none;text-align:center;padding:6px;color:#ff6b35;font-size:11px"></div>
 
   <div class="results" id="res">
+    <div id="aiScoreBox" style="display:none;margin-bottom:10px"></div>
     <div class="chart-box"><img id="chart" src=""><canvas id="chartCanvas" style="display:none;width:100%;height:480px;background:#0c0c0c"></canvas></div>
     <div class="cards">
       <div class="card"><h3>Predictions</h3><div id="pBody"></div></div>
@@ -1127,6 +1145,53 @@ function overlayPredictionsOnChart(predictions){
   });
   _chartJSInstance.update();
 }
+function overlaySimplePredictions(predictions, horizon){
+  if(!_chartJSInstance) return;
+  // Remove existing prediction datasets
+  var ds=_chartJSInstance.data.datasets;
+  for(var i=ds.length-1;i>=0;i--){ if(ds[i].label.startsWith('Pred')) ds.splice(i,1); }
+  // Get last historical data point
+  var lastData=ds[0]&&ds[0].data?ds[0].data[ds[0].data.length-1]:null;
+  if(!lastData) return;
+  var lastDate=lastData.x;
+  var lastPrice=lastData.y;
+  // Colors for each model
+  var colors={'Chronos-2':'#00aaff','Neural LSTM':'#ff00ff','TimesFM 2.5':'#ffcc00','Ensemble':'#ffffff'};
+  // Generate future dates and prediction lines
+  predictions.forEach(function(pred){
+    var color=colors[pred.model]||'#888';
+    var targetPrice=pred.target;
+    // Simple two-point line: last price → predicted price (horizon days out)
+    var predData=[
+      {x:lastDate,y:lastPrice},
+      {x:'+'+horizon+'d',y:targetPrice}
+    ];
+    ds.push({
+      label:'Pred '+pred.model,
+      data:predData,
+      borderColor:color,borderWidth:2,pointRadius:4,fill:false,tension:0,
+      borderDash:[6,4]
+    });
+  });
+  _chartJSInstance.update();
+}
+function overlaySimplePredictions(predictions, horizon){
+  if(!_chartJSInstance) return;
+  var ds=_chartJSInstance.data.datasets;
+  for(var i=ds.length-1;i>=0;i--){ if(ds[i].label.startsWith('Pred')) ds.splice(i,1); }
+  var lastData=ds[0]&&ds[0].data?ds[0].data[ds[0].data.length-1]:null;
+  if(!lastData) return;
+  var lastDate=lastData.x;
+  var lastPrice=lastData.y;
+  var colors={'Chronos-2':'#00aaff','Neural LSTM':'#ff00ff','TimesFM 2.5':'#ffcc00','Ensemble':'#ffffff'};
+  predictions.forEach(function(pred){
+    var color=colors[pred.model]||'#888';
+    var targetPrice=pred.target;
+    var predData=[{x:lastDate,y:lastPrice},{x:'+'+horizon+'d',y:targetPrice}];
+    ds.push({label:'Pred '+pred.model,data:predData,borderColor:color,borderWidth:2,pointRadius:4,fill:false,tension:0,borderDash:[6,4]});
+  });
+  _chartJSInstance.update();
+}
 function clearPredictionsFromChart(){
   if(!_chartJSInstance) return;
   var ds=_chartJSInstance.data.datasets;
@@ -1191,7 +1256,22 @@ function clearError(){
 
 function showPredictions(d){
   clearError();
-  if(d.chart_url){document.getElementById('chart').src=d.chart_url+'?t='+Date.now();}
+  // AI Score display at top of results
+  var ai=d.ai_score;
+  if(ai){
+    var aicls=ai.label==='Strong Buy'||ai.label==='Buy'?'ss-bullish':ai.label==='Strong Sell'||ai.label==='Sell'?'ss-bearish':'ss-neutral';
+    var aih='<div class="ai-section"><div class="ai-score-header">AI Score</div><div class="ai-score-big"><span class="ss-label '+aicls+'">'+escHtml(ai.emoji)+' '+escHtml(ai.label)+' <span class="score-num">'+escHtml(String(ai.score))+'</span></span><span style="font-size:12px;color:#555">/ 100</span></div></div>';
+    document.getElementById('aiScoreBox').innerHTML=aih;
+    document.getElementById('aiScoreBox').style.display='block';
+  }else{
+    document.getElementById('aiScoreBox').style.display='none';
+  }
+  if(d.chart_url){
+    document.getElementById('chart').src=d.chart_url+'?t='+Date.now();
+    if(_renderMode==='browser'&&_chartJSInstance&&d.predictions&&d.predictions.length>0){
+      overlaySimplePredictions(d.predictions, d.horizon||12);
+    }
+  }
   var ph='';
   (d.predictions||[]).forEach(function(p){var c=p.delta>=0?'up':'down';ph+='<div class="row"><span>'+escHtml(p.model)+'</span><span class="val '+c+'">$'+p.target.toFixed(2)+' ('+(p.delta>=0?'+':'')+p.delta.toFixed(2)+'%)</span></div>'});
   if(ph)ph+='<div class="row" style="border-top:1px solid #333;margin-top:4px;padding-top:4px"><span>consensus</span><span class="val">'+escHtml(d.consensus||'N/A')+'</span></div><div class="row"><span>avg Δ</span><span class="val '+(d.avg_delta>=0?'up':'down')+'">'+(d.avg_delta||0).toFixed(2)+'%</span></div>';
@@ -1366,24 +1446,39 @@ function syncWatchBtn(t){
 function renderWatchlist(){
   var bar=document.getElementById('watchlistBar');
   if(!bar)return;
+  bar.innerHTML='';
   var t=val('target');
   var watched=t&&isWatched(t);
-  var addHtml='';
   if(t&&!watched){
-    addHtml='<div class="watch-add" onclick="addToWatchlist(val('target'));syncWatchBtn(val('target'));">+ Watch '+escHtml(t)+'</div>';
+    var addBtn=document.createElement('div');
+    addBtn.className='watch-add';
+    addBtn.textContent='+ Watch '+t;
+    addBtn.onclick=function(){ addToWatchlist(t); syncWatchBtn(t); };
+    bar.appendChild(addBtn);
   }else if(watched&&t){
-    addHtml='<div class="watch-add watching" onclick="removeFromWatchlist(val('target'));syncWatchBtn(val('target'));">★ Watching '+escHtml(t)+'</div>';
+    var remBtn=document.createElement('div');
+    remBtn.className='watch-add watching';
+    remBtn.textContent='★ Watching '+t;
+    remBtn.onclick=function(){ removeFromWatchlist(t); syncWatchBtn(t); };
+    bar.appendChild(remBtn);
   }
   if(_watchlist.length===0&&!t){
     bar.innerHTML='<span class="watch-empty">No watchlist items</span>';
     return;
   }
-  var h=addHtml;
   _watchlist.forEach(function(sym){
     var active=sym===t;
-    h+='<div class="watch-chip'+(active?' active':'')+'" onclick="document.getElementById('target').value=''+sym+'';onTargetChange();">'+sym+'<span class="x" onclick="event.stopPropagation();removeFromWatchlist(''+sym+'');syncWatchBtn(''+sym+'');">✕</span></div>';
+    var chip=document.createElement('div');
+    chip.className='watch-chip'+(active?' active':'');
+    chip.textContent=sym;
+    chip.onclick=function(){ document.getElementById('target').value=sym; onTargetChange(); };
+    var x=document.createElement('span');
+    x.className='x';
+    x.textContent='✕';
+    x.onclick=function(e){ e.stopPropagation(); removeFromWatchlist(sym); syncWatchBtn(sym); };
+    chip.appendChild(x);
+    bar.appendChild(chip);
   });
-  bar.innerHTML=h;
 }
 
 // ── Autocomplete ──

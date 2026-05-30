@@ -84,7 +84,7 @@ def generate_forecast_chart(
             ohlc[col] = raw_vals.values
     ohlc.dropna(inplace=True)
 
-    SHOW_BARS = min(60, len(ohlc))
+    SHOW_BARS = len(ohlc)  # Show ALL data for selected range
     ohlc_dates = ohlc.index[-SHOW_BARS:]
     ohlc = ohlc.tail(SHOW_BARS).copy()
 
@@ -238,7 +238,7 @@ def generate_forecast_chart(
     ax2.set_xlim(-1.5, n_hist + horizon + 1)
     ax3.set_xlim(-1.5, n_hist + horizon + 1)
 
-    ax1.set_title(f"  {target}  |  {helper}  |  H={horizon}",
+    ax1.set_title(f"  {target}  |  {helper}  |  H={horizon}  |  {data_range.upper()}",
                   fontsize=13, color='white', pad=8, loc='left')
     ax1.legend(loc="upper left", fontsize=8, facecolor='#111', edgecolor='#333', labelcolor='#aaa')
     ax1.set_xticklabels([])

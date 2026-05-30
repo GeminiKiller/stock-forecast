@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-Stock Forecast GUI — runs forecast as independent subprocess (no threads).
+Stock Forecast GUI v2 — WebSocket + Model Caching + Error Display
+
+Changes from v1:
+  - Flask-SocketIO for real-time progress (replaces 3s polling)
+  - Chronos-2 model cached in-process (subprocess for data download only)
+  - Error events and 2-min timeout in frontend
+
 Run:  python gui/app.py [port]
 """
-import os, sys, json, re, time, subprocess, threading
+import os, sys, json, re, time, subprocess, threading, traceback
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from flask import Flask, render_template_string, request, jsonify, send_file
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from flask import Flask, request, jsonify, send_file, render_template_string
+from flask_socketio import SocketIO, emit as socketio_emit
+import numpy as np
 
 WORKSPACE  = Path(__file__).resolve().parent.parent
 FORECAST   = WORKSPACE / "forecast.py"
@@ -14,46 +25,80 @@ PYTHON     = "/opt/homebrew/bin/python3.11"
 PORT       = int(sys.argv[1]) if len(sys.argv) > 1 else 9876
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'forecast-v2-secret'
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
 _jobs = {}
 _jobs_lock = threading.Lock()
 
+
+# ── WebSocket namespace ──────────────────────────────────────
+@socketio.on('connect')
+def handle_connect():
+    print(f"[WS] Client connected: {request.sid}")
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f"[WS] Client disconnected: {request.sid}")
+
+
+@socketio.on('start_forecast')
+def handle_start_forecast(data):
+    """Client initiates a forecast via websocket."""
+    target     = (data.get('target') or 'APLD').upper()
+    helper     = (data.get('helper') or 'NVDA').upper()
+    horizon    = int(data.get('horizon', 12))
+    data_range = (data.get('dataRange') or '1y').lower()
+    chart_type = data.get('chartType', 'candle')
+    use_tfm    = data.get('use_timesfm', False)
+    use_chr    = data.get('use_chronos', True)
+    use_lstm   = data.get('use_lstm', False)
+
+    jid, cached = _submit_job(target, helper, horizon, use_tfm, use_chr, use_lstm, data_range, chart_type)
+
+    if cached:
+        with _jobs_lock:
+            j = _jobs.get(jid, {})
+        socketio_emit('done', {'job_id': jid, 'result': j.get('result', {})})
+    else:
+        socketio_emit('started', {'job_id': jid})
+
+
+# ── Job submission ────────────────────────────────────────────
 def _submit_job(target, helper, horizon, use_tfm, use_chr, use_lstm, data_range="1y", chart_type="candle"):
-    data_range = data_range.lower()  # normalize: frontend uppercases values
+    data_range = data_range.lower()
     flags = f"{'T' if use_tfm else ''}{'C' if use_chr else ''}{'L' if use_lstm else ''}"
     jid = f"{target}_{helper}_{horizon}_{data_range}_{chart_type}_{flags}"
 
-    # Check cached/complete jobs — release lock before calling _complete_job
-    # to avoid deadlock (threading.Lock is NOT reentrant, and _complete_job
-    # acquires _jobs_lock internally for final update).
-    needs_complete = None
     with _jobs_lock:
         j = _jobs.get(jid)
         if j and j["status"] == "done" and (time.time() - j["ts"]) < 300:
             return jid, True
         if j and j["status"] == "running":
-            proc = j.get("proc")
-            if proc and proc.poll() is not None:
-                needs_complete = (jid, j)
-            else:
-                return jid, False
+            return jid, False
 
-    if needs_complete:
-        return _complete_job(*needs_complete)
-
-    # Start new forecast as independent subprocess
+    # Start new job
     chart_path = WORKSPACE / f"{target}_{helper}_{horizon}_{data_range}_{chart_type}_forecast.png"
-    cmd = [PYTHON, str(FORECAST), target, helper,
-           "--horizon", str(horizon), "--data-range", data_range,
-           "--chart-type", chart_type, "--output", str(chart_path)]
-    if not use_tfm:  cmd.append("--no-timesfm")
-    if not use_chr:  cmd.append("--no-chronos")
-    if not use_lstm: cmd.append("--no-lstm")
+    csv_path = WORKSPACE / "_forecast_data.csv"
 
-    # Launch process (non-blocking, independent from Flask)
+    # Launch subprocess for data download + indicators only (no models, no chart)
+    cmd = [
+        PYTHON, str(FORECAST), target, helper,
+        "--horizon", str(horizon), "--data-range", data_range,
+        "--chart-type", chart_type,
+        "--output", str(chart_path),
+        "--data-only",  # Only download data + compute indicators, skip models + chart
+    ]
+    if not use_tfm:
+        cmd.append("--no-timesfm")
+    # Models are handled in-process, not in subprocess
+
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
-    # Background thread to read status lines from stdout
+    # Background thread to read status lines from subprocess
     status_lines = []
+
     def _read_status():
         try:
             for line in proc.stdout:
@@ -61,133 +106,472 @@ def _submit_job(target, helper, horizon, use_tfm, use_chr, use_lstm, data_range=
                 if line:
                     status_lines.append(line)
         except: pass
+
     reader_thread = threading.Thread(target=_read_status, daemon=True)
     reader_thread.start()
 
     with _jobs_lock:
-        _jobs[jid] = {"status": "running", "target": target, "ts": time.time(),
-                       "proc": proc, "chart_path": str(chart_path),
-                       "helper": helper, "horizon": horizon, "data_range": data_range,
-                       "chart_type": chart_type,
-                       "status_lines": status_lines, "reader_thread": reader_thread,
-                       "progress": "Starting..."}
+        _jobs[jid] = {
+            "status": "running",
+            "target": target,
+            "helper": helper,
+            "horizon": horizon,
+            "data_range": data_range,
+            "chart_type": chart_type,
+            "use_tfm": use_tfm,
+            "use_chr": use_chr,
+            "use_lstm": use_lstm,
+            "ts": time.time(),
+            "proc": proc,
+            "chart_path": str(chart_path),
+            "csv_path": str(csv_path),
+            "status_lines": status_lines,
+            "reader_thread": reader_thread,
+            "last_emitted_line": -1,
+        }
+
+    # Start the websocket emitter + job completion thread
+    t = threading.Thread(target=_job_lifecycle, args=(jid,), daemon=True)
+    t.start()
+
     return jid, False
 
 
-def _complete_job(jid, job):
-    """Called when the subprocess has finished — parses output and news."""
+def _emit_progress(jid, stage, state, line=""):
+    """Emit a progress event via websocket."""
+    socketio.emit('progress', {
+        'job_id': jid,
+        'stage': stage,
+        'state': state,
+        'line': line
+    })
+
+
+def _emit_error(jid, message, exit_code=None):
+    """Emit an error event via websocket."""
+    socketio.emit('error', {
+        'job_id': jid,
+        'message': message,
+        'exit_code': exit_code
+    })
+
+
+def _job_lifecycle(jid):
+    """Background thread: monitors subprocess, runs models, generates chart, emits events."""
+    with _jobs_lock:
+        job = _jobs.get(jid)
+        if not job:
+            return
+
+    proc = job["proc"]
+    status_lines = job["status_lines"]
+    last_emitted = -1
+
+    # Phase 1: Monitor subprocess for data download + indicators
+    while True:
+        time.sleep(0.3)
+
+        # Emit new status lines
+        new_lines = status_lines[last_emitted + 1:]
+        for line in new_lines:
+            if "[STATUS:" in line:
+                parts = line.strip("[]").split(":")
+                if len(parts) >= 3:
+                    stage = parts[1].strip()
+                    state = parts[2].strip()
+                    _emit_progress(jid, stage, state, line)
+            else:
+                _emit_progress(jid, 'log', 'running', line[:120])
+        last_emitted = len(status_lines) - 1
+
+        with _jobs_lock:
+            job = _jobs.get(jid, {})
+
+        # Check if subprocess exited
+        if proc.poll() is not None:
+            break
+
+    # Subprocess finished
+    exit_code = proc.poll()
+
+    # Wait for reader thread
+    reader_thread = job.get("reader_thread")
+    if reader_thread and reader_thread.is_alive():
+        reader_thread.join(timeout=2)
+
+    # Check for errors
+    if exit_code is not None and exit_code != 0:
+        err_lines = [l for l in status_lines
+                    if "error" in l.lower() or "traceback" in l.lower()
+                    or "exception" in l.lower()][-5:]
+        # Also check for Traceback blocks
+        in_traceback = False
+        tb_lines = []
+        for l in status_lines:
+            if "Traceback" in l:
+                in_traceback = True
+            if in_traceback:
+                tb_lines.append(l)
+                if l.strip().startswith("Error:") or l.strip().startswith("Exception:"):
+                    in_traceback = False
+        if tb_lines:
+            err_lines = tb_lines[-3:]
+        err_msg = "; ".join(err_lines[-3:]) if err_lines else f"Subprocess exited with code {exit_code}"
+        _emit_error(jid, err_msg, exit_code)
+        with _jobs_lock:
+            _jobs[jid] = {"status": "error", "result": {"error": err_msg, "exit_code": exit_code}, "ts": time.time()}
+        return
+
+    # Parse metadata from subprocess output
+    metadata = None
+    for line in status_lines:
+        if "[METADATA_JSON]" in line:
+            start = line.find("[METADATA_JSON]") + len("[METADATA_JSON]")
+            end = line.find("[/METADATA_JSON]")
+            if end > start:
+                try:
+                    metadata = json.loads(line[start:end])
+                except: pass
+            break
+
+    if not metadata:
+        # Try to extract current price from output lines
+        metadata = {}
+        for line in status_lines:
+            m = re.search(r'Current \w+: \$([\d.]+)', line)
+            if m:
+                metadata["current_price"] = float(m.group(1))
+                break
+
+    csv_path = Path(job.get("csv_path", ""))
+    chart_path = Path(job.get("chart_path", ""))
+
+    # Check if CSV exists
+    if not csv_path.exists():
+        _emit_error(jid, "Data CSV not found after download. Check if data download succeeded.")
+        with _jobs_lock:
+            _jobs[jid] = {"status": "error", "result": {"error": "Data CSV not found"}, "ts": time.time()}
+        return
+
+    # Phase 2: Run models in-process (with caching)
+    current_price = metadata.get("current_price", 0)
+    model_result = {}
+
+    use_chr = job.get("use_chr", True)
+    use_lstm = job.get("use_lstm", False)
+    use_tfm = job.get("use_tfm", False)
+    horizon = job.get("horizon", 12)
+
+    chronos_median = chronos_lo = chronos_hi = None
+    lstm_final = lstm_lo = lstm_hi = None
+    tfm_final = None
+
+    if use_chr or use_lstm:
+        _emit_progress(jid, 'models', 'running', '[STATUS:models:running] Running Chronos-2/LSTM in-process')
+        try:
+            from models.chronos_lstm_model import run_inference
+            result = run_inference(str(csv_path), horizon, use_chronos=use_chr, use_lstm=use_lstm)
+
+            if "chronos" in result:
+                chronos_median = np.array(result["chronos"])
+                chronos_lo = np.array(result.get("chronos_lower", result["chronos"]))
+                chronos_hi = np.array(result.get("chronos_upper", result["chronos"]))
+                _emit_progress(jid, 'chronos', 'done', '[STATUS:chronos:done] Chronos-2 complete')
+
+            if "chronos_error" in result:
+                _emit_progress(jid, 'chronos', 'failed', f'[STATUS:chronos:failed] {result["chronos_error"]}')
+
+            if "lstm" in result:
+                lstm_final = np.array(result["lstm"])
+                lstm_lo = np.array(result.get("lstm_lower", result["lstm"]))
+                lstm_hi = np.array(result.get("lstm_upper", result["lstm"]))
+                _emit_progress(jid, 'lstm', 'done', '[STATUS:lstm:done] LSTM complete')
+
+            if "lstm_error" in result:
+                _emit_progress(jid, 'lstm', 'failed', f'[STATUS:lstm:failed] {result["lstm_error"]}')
+
+            model_result.update(result)
+        except Exception as e:
+            _emit_progress(jid, 'models', 'failed', f'[STATUS:models:failed] {e}')
+
+    if use_tfm:
+        _emit_progress(jid, 'TimesFM 2.5', 'running', '[STATUS:TimesFM 2.5:running]')
+        try:
+            cmd = [PYTHON, str(WORKSPACE / "models" / "timesfm_model.py"), str(csv_path), str(horizon)]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if r.returncode == 0 and r.stdout.strip():
+                json_start = r.stdout.find('{')
+                if json_start >= 0:
+                    tfm_data = json.loads(r.stdout[json_start:])
+                    if "predictions" in tfm_data:
+                        tfm_final = np.array(tfm_data["predictions"])
+                        _emit_progress(jid, 'TimesFM 2.5', 'done', '[STATUS:TimesFM 2.5:done]')
+                    elif "error" in tfm_data:
+                        model_result["tfm_error"] = tfm_data["error"]
+                        _emit_progress(jid, 'TimesFM 2.5', 'failed', f'[STATUS:TimesFM 2.5:failed] {tfm_data["error"]}')
+            else:
+                stderr_snippet = (r.stderr or "")[-200:]
+                model_result["tfm_error"] = f"TimesFM exited with code {r.returncode}: {stderr_snippet}"
+                _emit_progress(jid, 'TimesFM 2.5', 'failed', f'[STATUS:TimesFM 2.5:failed] exit code {r.returncode}')
+        except Exception as e:
+            model_result["tfm_error"] = str(e)
+            _emit_progress(jid, 'TimesFM 2.5', 'failed', f'[STATUS:TimesFM 2.5:failed] {e}')
+
+    # Phase 3: Conformal calibration
+    _emit_progress(jid, 'conformal', 'running', '[STATUS:conformal:running]')
     try:
-        proc = job.get("proc")
-        reader_thread = job.get("reader_thread")
-        if reader_thread and reader_thread.is_alive():
-            reader_thread.join(timeout=2)
+        from mapie.regression import SplitConformalRegressor
+        from sklearn.linear_model import LinearRegression
 
-        # Check exit code: non-zero means subprocess crashed
-        exit_code = proc.poll() if proc else None
-        all_output = "\n".join(job.get("status_lines", []))
+        all_preds = []
+        if tfm_final is not None:      all_preds.append(tfm_final)
+        if chronos_median is not None: all_preds.append(chronos_median)
+        if lstm_final is not None:     all_preds.append(lstm_final)
 
-        result = _parse(all_output, job["target"], job["helper"])
+        band_lo = band_hi = None
+        ensemble_median = None
 
-        # If subprocess exited with error, surface it
-        if exit_code is not None and exit_code != 0:
-            err_lines = [l for l in job.get("status_lines", [])
-                        if "error" in l.lower() or "traceback" in l.lower()
-                        or "exception" in l.lower()][-3:]
-            err_detail = "; ".join(err_lines[-2:]) if err_lines else f"exit code {exit_code}"
-            result["error"] = err_detail
-            result["_exit_code"] = exit_code
+        if len(all_preds) >= 2:
+            ensemble_median = np.median(all_preds, axis=0)
+            df_data = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+            target_vals = df_data['close'].values.astype(np.float32)
+            recent = target_vals[-30:]
+            resid_scale = np.median(np.abs(recent - np.median(recent))) * 1.5
+            band_lo = ensemble_median - resid_scale
+            band_hi = ensemble_median + resid_scale
+        elif len(all_preds) == 1:
+            df_data = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+            target_vals = df_data['close'].values.astype(np.float32)
+            X_cal = np.arange(len(target_vals)-30, len(target_vals)).reshape(-1, 1)
+            y_cal = target_vals[-30:].ravel()
+            mapie = SplitConformalRegressor(
+                estimator=LinearRegression().fit(X_cal, y_cal),
+                confidence_level=0.9, prefit=True
+            )
+            mapie.conformalize(X_cal, y_cal)
+            _, y_pis = mapie.predict_interval(
+                np.arange(len(target_vals), len(target_vals)+horizon).reshape(-1, 1)
+            )
+            band_lo = y_pis[:, 0, 0]
+            band_hi = y_pis[:, 1, 0]
 
-        chart_name = f"{job['target']}_{job['helper']}_{job['horizon']}_{job['data_range']}_{job['chart_type']}_forecast.png"
-        chart = WORKSPACE / chart_name
-        if chart.exists():
-            result["chart_url"] = f"/chart/{chart_name}"
+        _emit_progress(jid, 'conformal', 'done', '[STATUS:conformal:done]')
+    except Exception as e:
+        _emit_progress(jid, 'conformal', 'failed', f'[STATUS:conformal:failed] {e}')
+        band_lo = band_hi = None
+        ensemble_median = None
+
+    # Phase 4: Generate chart in-process
+    _emit_progress(jid, 'chart', 'running', '[STATUS:chart:running]')
+    try:
+        from charting import generate_forecast_chart
+
+        chart_ok = generate_forecast_chart(
+            target=job["target"],
+            helper=job["helper"],
+            horizon=horizon,
+            data_range=job["data_range"],
+            chart_type=job["chart_type"],
+            rsi_val=metadata.get("rsi", 0),
+            ema_50=metadata.get("ema_50", 0),
+            td_count=metadata.get("td_count", 0),
+            bb_upper=metadata.get("bb_upper", 0),
+            current_price=current_price,
+            ema_label=metadata.get("ema_label", ""),
+            rsi_label=metadata.get("rsi_label", ""),
+            td_label=metadata.get("td_label", ""),
+            vol_label=metadata.get("vol_label", ""),
+            tfm_predictions=tfm_final,
+            chronos_median=chronos_median,
+            chronos_lo=chronos_lo,
+            chronos_hi=chronos_hi,
+            lstm_final=lstm_final,
+            lstm_lo=lstm_lo,
+            lstm_hi=lstm_hi,
+            band_lo=band_lo,
+            band_hi=band_hi,
+            ensemble_median=ensemble_median,
+            output_path=str(chart_path),
+            csv_path=str(csv_path),
+        )
+        if chart_ok:
+            _emit_progress(jid, 'chart', 'done', '[STATUS:chart:done]')
         else:
-            import glob as _glob
-            pattern = f"{job['target']}_{job['helper']}_*_forecast.png"
-            matches = _glob.glob(str(WORKSPACE / pattern))
-            if matches:
-                result["chart_url"] = f"/chart/{os.path.basename(matches[-1])}"
+            _emit_progress(jid, 'chart', 'failed', '[STATUS:chart:failed] Chart generation returned False')
+    except Exception as e:
+        _emit_progress(jid, 'chart', 'failed', f'[STATUS:chart:failed] {e}')
 
+    # Phase 5: Build result
+    result = {
+        "target": job["target"],
+        "helper": job["helper"],
+        "predictions": [],
+        "consensus": "N/A",
+        "avg_delta": 0,
+        "technicals": {},
+    }
+
+    # Technical indicators from metadata
+    tech = {}
+    if "rsi" in metadata:
+        tech["rsi"] = metadata["rsi"]
+        tech["rsi_label"] = metadata.get("rsi_label", "")
+    if "ema_50" in metadata:
+        tech["ema"] = metadata["ema_50"]
+        tech["ema_label"] = metadata.get("ema_label", "")
+    if "td_count" in metadata:
+        tc = metadata["td_count"]
+        tech["td_count"] = tc if tc else None
+        tech["td_label"] = metadata.get("td_label", "")
+    if "bb_upper" in metadata:
+        tech["bb_upper"] = metadata["bb_upper"]
+        tech["vol_label"] = metadata.get("vol_label", "")
+    if tech:
+        result["technicals"] = tech
+
+    # Build predictions
+    predictions = []
+    if tfm_final is not None:
+        p = float(tfm_final[-1])
+        d = ((p - current_price) / current_price) * 100 if current_price else 0
+        predictions.append({"model": "TimesFM 2.5", "target": p, "delta": d})
+    if chronos_median is not None:
+        p = float(chronos_median[-1])
+        d = ((p - current_price) / current_price) * 100 if current_price else 0
+        predictions.append({"model": "Chronos-2", "target": p, "delta": d})
+    if lstm_final is not None:
+        p = float(lstm_final[-1])
+        d = ((p - current_price) / current_price) * 100 if current_price else 0
+        predictions.append({"model": "Neural LSTM", "target": p, "delta": d})
+
+    result["predictions"] = predictions
+
+    # Consensus
+    if predictions:
+        deltas = [p["delta"] for p in predictions]
+        result["avg_delta"] = sum(deltas) / len(deltas)
+        if all(d > 0 for d in deltas):
+            result["consensus"] = "STRONG UP"
+        elif all(d < 0 for d in deltas):
+            result["consensus"] = "STRONG DOWN"
+        else:
+            result["consensus"] = "CONTRADICTORY"
+
+    # Chart URL
+    if chart_path.exists():
+        result["chart_url"] = f"/chart/{chart_path.name}"
+    else:
+        import glob as _glob
+        pattern = f"{job['target']}_{job['helper']}_*_forecast.png"
+        matches = _glob.glob(str(WORKSPACE / pattern))
+        if matches:
+            result["chart_url"] = f"/chart/{os.path.basename(matches[-1])}"
+
+    # Phase 6: Fetch news
+    _emit_progress(jid, 'news', 'running', '[STATUS:news:running]')
+    try:
         from news import get_news_and_ratings
-        job["status_lines"].append("[STATUS:news:running]")
         nd = get_news_and_ratings(job["target"])
-        job["status_lines"].append("[STATUS:news:done]")
+        _emit_progress(jid, 'news', 'done', '[STATUS:news:done]')
         result["news"] = nd.get("news", [])[:10]
         result["analyst"] = nd.get("analyst", {"available": False})
         result["earnings"] = nd.get("earnings", {"available": False})
-
-        job["proc"] = None  # Release proc reference
-        with _jobs_lock:
-            _jobs[jid] = {"status": "done", "result": result, "ts": time.time()}
-        return jid, True
     except Exception as e:
+        _emit_progress(jid, 'news', 'failed', f'[STATUS:news:failed] {e}')
+        result["news"] = []
+        result["analyst"] = {"available": False}
+        result["earnings"] = {"available": False}
+
+    # Clean up
+    with _jobs_lock:
+        _jobs[jid] = {"status": "done", "result": result, "ts": time.time()}
+
+    # Clean up CSV
+    try:
+        if csv_path.exists():
+            csv_path.unlink()
+    except: pass
+
+    # Emit done
+    socketio.emit('done', {'job_id': jid, 'result': result})
+    print(f"[JOB] Completed: {jid}")
+
+
+# ── REST Endpoints ───────────────────────────────────────────
+@app.route("/")
+def index():
+    return render_template_string(PAGE)
+
+
+@app.route("/api/start", methods=["POST"])
+def api_start():
+    """REST fallback — starts job and returns job_id. Progress comes via websocket."""
+    jid, cached = _submit_job(
+        request.form.get("target", "APLD").upper(),
+        request.form.get("helper", "NVDA").upper(),
+        int(request.form.get("horizon", 12)),
+        request.form.get("use_timesfm") == "true",
+        request.form.get("use_chronos") == "true",
+        request.form.get("use_lstm") == "true",
+        request.form.get("dataRange", "1y"),
+        request.form.get("chartType", "candle"),
+    )
+    if cached:
         with _jobs_lock:
-            _jobs[jid] = {"status": "error", "result": {"error": str(e)}, "ts": time.time()}
-        return jid, False
+            j = _jobs.get(jid, {})
+        return jsonify({"status": "done", "job_id": jid, "result": j.get("result", {})})
+    return jsonify({"status": "started", "job_id": jid})
 
 
-def _parse(text, target, helper):
-    lines = text.splitlines()
-    res = {"target": target, "helper": helper, "predictions": [], "consensus": "N/A", "avg_delta": 0}
-    in_table = False
-    for line in lines:
-        if "MODEL" in line and "BIAS" in line:
-            in_table = True; continue
-        if in_table and line.strip().startswith("─"): continue
-        if in_table and line.strip().startswith("="): in_table = False; continue
-        if in_table and "|" in line:
-            p = [x.strip() for x in line.split("|")]
-            if len(p) >= 4 and p[0] and p[0] != "MODEL":
-                try:
-                    price = float(p[1].replace("$", "").replace(",", ""))
-                    delta = float(p[2].replace("%", "").strip())
-                    res["predictions"].append({"model": p[0], "target": price, "delta": delta})
-                except: pass
-    for line in lines:
-        s = line.strip()
-        if "CONSENSUS" in s and ":" in s:
-            res["consensus"] = s.split(":", 1)[-1].strip()
-        if "AVG DELTA" in s and ":" in s:
-            try: res["avg_delta"] = float(s.split(":", 1)[-1].strip().replace("%","").replace("+",""))
-            except: pass
-    tech = {}
-    for line in lines:
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 3: continue
-        label = parts[1]; val_col = parts[2] if len(parts) > 2 else ""
-        if "RSI" in label:
-            m = re.search(r":\s*([\d.]+)", label)
-            if m:
-                try: tech["rsi"] = float(m.group(1))
-                except: pass
-            tech["rsi_label"] = val_col.strip().strip("[]")
-        if "EMA" in label and "50" in label:
-            m = re.search(r":\s*(\w+)", label)
-            if m: tech["ema_label"] = m.group(1)
-            m2 = re.search(r"\$([\d,.]+)", val_col)
-            if m2:
-                try: tech["ema"] = float(m2.group(1).replace(",",""))
-                except: tech["ema"] = 0
-        if "TD" in label and "SETUP" in label:
-            m = re.search(r":\s*(\d+)", label)
-            if m:
-                try: tech["td_count"] = int(m.group(1)) or None
-                except: tech["td_count"] = None
-            tech["td_label"] = val_col
-        if "VOLATILITY" in label:
-            m = re.search(r":\s*(\w+)", label)
-            if m: tech["vol_label"] = m.group(1)
-            m2 = re.search(r"\$([\d,.]+)", val_col)
-            if m2:
-                try: tech["bb_upper"] = float(m2.group(1).replace(",",""))
-                except: tech["bb_upper"] = 0
-    if tech: res["technicals"] = tech
-    return res
+@app.route("/api/cache-status")
+def api_cache_status():
+    """Check which models are cached in memory."""
+    try:
+        from models.chronos_lstm_model import is_chronos_cached
+        chronos = is_chronos_cached()
+    except:
+        chronos = False
+    return jsonify({
+        "chronos_cached": chronos,
+    })
 
-# ── HTML (same as before) ────────────────────────────────────
+
+@app.route("/chart/<path:chart_name>")
+def chart(chart_name):
+    p = WORKSPACE / chart_name
+    return send_file(p, mimetype="image/png") if p.exists() else ("", 404)
+
+
+@app.route("/api/news/<ticker>")
+def api_news(ticker):
+    """Fetch news/analyst/earnings immediately — no forecast needed."""
+    try:
+        from news import get_news_and_ratings
+        nd = get_news_and_ratings(ticker.upper())
+        return jsonify({
+            "news": nd.get("news", [])[:10],
+            "analyst": nd.get("analyst", {"available": False}),
+            "earnings": nd.get("earnings", {"available": False}),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/chart-ready/<path:chart_name>")
+def api_chart_ready(chart_name):
+    p = WORKSPACE / chart_name
+    return jsonify({"ready": p.exists() and p.stat().st_size > 1000})
+
+
+@app.route("/test")
+def test():
+    return send_file(WORKSPACE / "gui" / "test_standalone.html")
+
+
+# ── HTML (dark cyberpunk theme, WebSocket-based) ──────────────
 PAGE = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>⚡ Forecast</title>
+<title>⚡ Forecast v2</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'SF Mono','Fira Code','Cascadia Code',monospace;background:#0c0c0c;color:#c0c0c0;min-height:100vh;font-size:13px}
@@ -235,10 +619,23 @@ h1 span{color:#ff6b35}
 .l-buy::before{background:#00ff88}.l-hold::before{background:#555}.l-sell::before{background:#ff4444}
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid #333;border-top-color:#00ff88;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:6px}
 @keyframes spin{to{transform:rotate(360deg)}}
-</style></head><body>
+.error-msg{color:#ff4444;background:#1a0a0a;border:1px solid #444;border-radius:2px;padding:10px 14px;font-size:12px;margin:8px 0;text-align:left;font-family:inherit;line-height:1.5}
+.timeout-warn{color:#ff6b35;font-size:11px;margin-top:4px}
+.cache-status{font-size:10px;color:#555;text-align:center;margin-bottom:8px}
+.cache-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px;vertical-align:middle}
+.cache-dot.on{background:#00ff88;box-shadow:0 0 4px #00ff88}
+.cache-dot.off{background:#444}
+.ws-status{font-size:10px;color:#333;text-align:right;float:right;margin-top:-20px;margin-bottom:10px}
+.ws-status.connected{color:#00ff88}
+.ws-status.disconnected{color:#ff4444}
+</style>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+</head><body>
 <div class="container">
-  <h1>⚡ <span>Forecast</span></h1>
-  <p class="subtitle">TIMESFM 2.5 · CHRONOS-2 · LSTM · CONFORMAL CALIBRATION · TD SEQUENTIAL</p>
+  <h1>⚡ <span>Forecast</span> <span style="font-size:10px;color:#444">v2</span></h1>
+  <p class="subtitle">TIMESFM 2.5 · CHRONOS-2 · LSTM · CONFORMAL CALIBRATION · TD SEQUENTIAL · <span style="color:#00ff88">REAL-TIME WS</span></p>
+
+  <div id="wsStatus" class="ws-status disconnected">⬤ offline</div>
 
   <div class="form">
     <div class="field"><label>Target</label><input id="target" placeholder="e.g. APLD" value="APLD"></div>
@@ -268,10 +665,10 @@ h1 span{color:#ff6b35}
         <p style="color:#888;margin-bottom:6px"><b style="color:#aaa">Models:</b></p>
         <ul style="color:#666;margin:0 0 8px 16px;padding:0">
           <li><b style="color:#ff7f0e">TimesFM 2.5</b> — Google's time series model (~2min)</li>
-          <li><b style="color:#00d4ff">Chronos-2</b> — Amazon's probabilistic forecaster</li>
+          <li><b style="color:#00d4ff">Chronos-2</b> — Amazon's probabilistic forecaster (cached in-memory!)</li>
           <li><b style="color:#00ff88">LSTM</b> — neural network with MC dropout</li>
         </ul>
-        <p style="color:#888;margin-bottom:0"><b style="color:#aaa">Chart:</b> Green/red = candlesticks. Colored bands = model confidence. Orange band = ensemble. TD numbers = DeMark setup (⚠9 = reversal). Volume = middle panel.</p>
+        <p style="color:#888;margin-bottom:0"><b style="color:#aaa">v2:</b> WebSocket real-time progress · Model caching = faster subsequent runs · Error display + timeout alerts</p>
       </div>
     </div>
   </div>
@@ -282,8 +679,10 @@ h1 span{color:#ff6b35}
     <label><input type="checkbox" id="oL" onchange="checkResources()"> LSTM</label>
   </div>
 
-  <div class="status" id="st"></div>
+  <div id="cacheInfo" class="cache-status"></div>
 
+  <div class="status" id="st"></div>
+  <div id="errBox" style="display:none"></div>
   <div id="warnBox" style="display:none;text-align:center;padding:6px;color:#ff6b35;font-size:11px"></div>
 
   <div class="results" id="res">
@@ -297,240 +696,203 @@ h1 span{color:#ff6b35}
   </div>
 </div>
 <script>
+// ── WebSocket connection ──
+var socket = io();
+var currentJobId = null;
+var lastProgressTs = Date.now();
+var timeoutInterval = null;
+var completedStages = [];
+var currentStage = '';
+var chartType = 'candle';
+
+socket.on('connect', function() {
+  console.log('[WS] Connected:', socket.id);
+  document.getElementById('wsStatus').className = 'ws-status connected';
+  document.getElementById('wsStatus').textContent = '⬤ connected';
+  loadCacheStatus();
+});
+
+socket.on('disconnect', function() {
+  console.log('[WS] Disconnected');
+  document.getElementById('wsStatus').className = 'ws-status disconnected';
+  document.getElementById('wsStatus').textContent = '⬤ offline';
+});
+
+socket.on('started', function(data) {
+  console.log('[WS] Job started:', data.job_id);
+  currentJobId = data.job_id;
+  lastProgressTs = Date.now();
+  startTimeoutWatch();
+});
+
+socket.on('progress', function(data) {
+  console.log('[WS] Progress:', data.stage, data.state);
+  lastProgressTs = Date.now();
+  clearError();
+
+  if (data.stage === 'log') {
+    document.getElementById('st').innerHTML = '<span class="spinner"></span> ' + escHtml(data.line);
+    return;
+  }
+
+  // Track completed stages
+  if (data.state === 'done' && data.stage !== 'log') {
+    if (!completedStages.includes(data.stage)) completedStages.push(data.stage);
+  }
+  if (data.state === 'running' && data.stage !== 'log') {
+    currentStage = data.stage;
+  }
+  if (data.state === 'failed') {
+    if (!completedStages.includes(data.stage)) completedStages.push('❌ ' + data.stage);
+  }
+
+  // Build progress display
+  var totalStages = 3 + (document.getElementById('oT').checked?1:0) + (document.getElementById('oC').checked?1:0) + (document.getElementById('oL').checked?1:0);
+  var parts = completedStages.map(m => '✅ ' + m);
+  if (currentStage && !completedStages.includes(currentStage) && !completedStages.includes('❌ ' + currentStage))
+    parts.push('🔄 ' + currentStage);
+  var txt = parts.length ? parts.join(' → ') + ' (' + completedStages.length + '/' + totalStages + ')' : 'starting...';
+  document.getElementById('st').innerHTML = '<span class="spinner"></span> ' + txt;
+});
+
+socket.on('done', function(data) {
+  console.log('[WS] Done:', data.job_id);
+  stopTimeoutWatch();
+  showPredictions(data.result);
+  document.getElementById('st').innerHTML = '';
+  document.getElementById('btn').disabled = false;
+  currentJobId = null;
+  loadCacheStatus();
+});
+
+socket.on('error', function(data) {
+  console.log('[WS] Error:', data);
+  stopTimeoutWatch();
+  showError(data.message || 'Unknown server error');
+  document.getElementById('btn').disabled = false;
+  currentJobId = null;
+});
+
+// ── Timeout watch: if no progress for 2 minutes, show warning ──
+function startTimeoutWatch() {
+  stopTimeoutWatch();
+  lastProgressTs = Date.now();
+  timeoutInterval = setInterval(function() {
+    var elapsed = Date.now() - lastProgressTs;
+    if (elapsed > 120000) {
+      document.getElementById('st').innerHTML = '<span style="color:#ff6b35">⚠️ No response for 2 min. The forecast may be stuck.</span>';
+    }
+  }, 10000);
+}
+
+function stopTimeoutWatch() {
+  if (timeoutInterval) { clearInterval(timeoutInterval); timeoutInterval = null; }
+}
+
+// ── Form handlers ──
 function toggleHelp(){var p=document.getElementById('helpPanel');p.style.display=p.style.display==='none'?'block':'none'}
-var chartType='candle';
 function checkResources(){
-  var dr=val('dataRange'), tfm=chk('oT'), lstm=chk('oL'), w=$('warnBox');
+  var dr=val('dataRange'), tfm=document.getElementById('oT').checked, lstm=document.getElementById('oL').checked, w=document.getElementById('warnBox');
   var msgs=[];
-  if(dr==='2Y'||dr==='5Y'||dr==='MAX')msgs.push('Large data range ('+dr+') — may be slow');
-  if(dr==='MAX')msgs.push('⚠️ Max data may cause out-of-memory crash');
-  if(tfm)msgs.push('TimesFM is heavy (~2 min, jax/torch)');
-  if(lstm)msgs.push('LSTM runs 30 MC passes (~2 min, tensorflow)');
+  if(dr==='2y'||dr==='5y'||dr==='max')msgs.push('Large data range — may be slow');
+  if(dr==='max')msgs.push('⚠️ Max data may cause OOM');
+  if(tfm)msgs.push('TimesFM is heavy (~2 min)');
+  if(lstm)msgs.push('LSTM runs 30 MC passes (~2 min)');
   w.innerHTML=msgs.length?msgs.map(m=>'⚠️ '+m).join(' · '):'';
   w.style.display=msgs.length?'block':'none';
 }
 function setChartType(t){chartType=t;document.getElementById('btnCandle').className=t==='candle'?'active':'';document.getElementById('btnLine').className=t==='line'?'active':'';if(document.getElementById('res').classList.contains('active'))run()}
+
 function $(id){return document.getElementById(id)}
 function val(id){return $(id).value.trim().toUpperCase()}
 function chk(id){return $(id).checked}
 
+function loadCacheStatus(){
+  fetch('/api/cache-status').then(function(r){return r.json()}).then(function(d){
+    var chronos = d.chronos_cached ? '<span class="cache-dot on"></span>Cached' : '<span class="cache-dot off"></span>Not cached';
+    document.getElementById('cacheInfo').innerHTML = 'Chronos-2: ' + chronos;
+  }).catch(function(){});
+}
+
 function run(){
-  const t=val('target'),h=val('helper'),hz=val('horizon');
+  var t=val('target'), h=val('helper'), hz=val('horizon');
   if(!t){alert('Enter ticker');return}
-  $('btn').disabled=true;$('st').innerHTML='<span class="spinner"></span> starting...';
-  $('res').classList.remove('active');
-  // Clear previous results
-  $('chart').src='';$('pBody').innerHTML='<div class="row" style="color:#444">waiting...</div>';
-  $('tBody').innerHTML='<div class="row" style="color:#444">waiting...</div>';
-  $('aBody').innerHTML='<div class="row" style="color:#444">loading...</div>';
-  $('nList').innerHTML='<li style="color:#444">loading...</li>';
-  $('res').classList.add('active');
-  // Fetch news/analyst immediately — no waiting for forecast
-  fetch('/api/news/'+encodeURIComponent(t)).then(r=>r.json()).then(d=>{
-    showAnalyst(d);
-    showNews(d);
-  }).catch(()=>{});
-  // Start forecast + polling
-  const b=new URLSearchParams({target:t,helper:h,horizon:hz,dataRange:val('dataRange'),chartType:chartType,use_timesfm:chk('oT'),use_chronos:chk('oC'),use_lstm:chk('oL')});
-  fetch('/api/start',{method:'POST',body:b}).then(r=>r.json()).then(d=>{
-    if(d.status==='done'){showPredictions(d.result);$('st').innerHTML='';$('btn').disabled=false;return}
-    if(d.status==='error'){handleError(d);return}
-    if(d.status==='done'&&d.result&&d.result.chart_url){$('chart').src=d.result.chart_url+'?t='+Date.now();}
-    poll();
-  }).catch(e=>{handleError({result:{error:'Network: '+e.message}});$('btn').disabled=false});
+  document.getElementById('btn').disabled=true;
+  document.getElementById('st').innerHTML='<span class="spinner"></span> connecting...';
+  document.getElementById('errBox').style.display='none';
+  document.getElementById('res').classList.remove('active');
+  document.getElementById('chart').src='';
+  document.getElementById('pBody').innerHTML='<div class="row" style="color:#444">waiting...</div>';
+  document.getElementById('tBody').innerHTML='<div class="row" style="color:#444">waiting...</div>';
+  document.getElementById('aBody').innerHTML='<div class="row" style="color:#444">loading...</div>';
+  document.getElementById('nList').innerHTML='<li style="color:#444">loading...</li>';
+  document.getElementById('res').classList.add('active');
+  completedStages = [];
+  currentStage = '';
+  lastProgressTs = Date.now();
+
+  // Fetch news/analyst immediately
+  fetch('/api/news/'+encodeURIComponent(t)).then(function(r){return r.json()}).then(function(d){
+    showAnalyst(d); showNews(d);
+  }).catch(function(){});
+
+  // Start forecast via WebSocket
+  socket.emit('start_forecast', {
+    target: t, helper: h, horizon: hz,
+    dataRange: val('dataRange'), chartType: chartType,
+    use_timesfm: document.getElementById('oT').checked,
+    use_chronos: document.getElementById('oC').checked,
+    use_lstm: document.getElementById('oL').checked
+  });
 }
-function poll(){
-  const t=val('target'),h=val('helper'),hz=val('horizon'),dr=val('dataRange');
-  let n=0, chartLoaded=false, completed=[], current='';
-  const totalModels=1+(chk('oT')?1:0)+(chk('oL')?1:0);
-  const iv=setInterval(()=>{
-    n++;if(n>180){clearInterval(iv);$('st').textContent='timeout (6min)';$('btn').disabled=false;return}
-    const b=new URLSearchParams({target:t,helper:h,horizon:hz,dataRange:dr,chartType:chartType,use_timesfm:chk('oT'),use_chronos:chk('oC'),use_lstm:chk('oL')});
-    fetch('/api/start',{method:'POST',body:b}).then(r=>r.json()).then(d=>{
-      if(d.status==='done'){clearInterval(iv);showPredictions(d.result);$('st').innerHTML='';$('btn').disabled=false;return}
-      if(d.status==='error'){clearInterval(iv);handleError(d);return}
-      if(d.completed_stages&&d.completed_stages.length>0){
-        completed=d.completed_stages;
-      }
-      if(d.model&&d.model_state){
-        current=d.model;
-        if(d.model_state==='done'&&!completed.includes(d.model))completed.push(d.model);
-      }
-      var totalStages=4+(chk('oT')||chk('oL')?1:0)+(chk('oC')?1:0); // data+indicators+conformal+chart + models
-      var txt='';
-      var parts=[];
-      if(completed.length>0)parts=completed.map(m=>'✅ '+m);
-      if(current&&!parts.includes('✅ '+current))parts.push('🔄 '+current);
-      if(parts.length)txt=parts.join(' → ')+' ('+completed.length+'/'+totalStages+' stages)';
-      else txt='downloading... ('+n+')';
-      $('st').innerHTML='<span class="spinner"></span> '+txt;
-      if(d.status==='done'&&d.result&&d.result.chart_url&&!chartLoaded){
-        chartLoaded=true;$('chart').src=d.result.chart_url+'?t='+Date.now();
-      }
-    }).catch(e=>{$('st').textContent='ERR: '+e;clearInterval(iv);$('btn').disabled=false});
-  },3000);
+
+function showError(msg){
+  document.getElementById('errBox').innerHTML='<div class="error-msg">❌ '+escHtml(msg)+'</div>';
+  document.getElementById('errBox').style.display='block';
+  document.getElementById('st').innerHTML='';
+  document.getElementById('st').style.color='';
 }
-function handleError(d){
-  var msg='❌ ';
-  if(d.result&&d.result.error)msg+=d.result.error;
-  else msg+='Unknown server error';
-  $('st').innerHTML=msg;
-  $('st').style.color='#ff4444';
-  $('btn').disabled=false;
+function clearError(){
+  document.getElementById('errBox').style.display='none';
+  document.getElementById('st').style.color='#00ff88';
 }
+
 function showPredictions(d){
-  if(d.chart_url){$('chart').src=d.chart_url+'?t='+Date.now();}
-  let ph='';
-  (d.predictions||[]).forEach(p=>{const c=p.delta>=0?'up':'down';ph+=`<div class="row"><span>${p.model}</span><span class="val ${c}">$${p.target.toFixed(2)} (${p.delta>=0?'+':''}${p.delta.toFixed(2)}%)</span></div>`});
-  if(ph)ph+=`<div class="row" style="border-top:1px solid #333;margin-top:4px;padding-top:4px"><span>consensus</span><span class="val">${d.consensus||'N/A'}</span></div><div class="row"><span>avg Δ</span><span class="val ${(d.avg_delta||0)>=0?'up':'down'}">${(d.avg_delta||0).toFixed(2)}%</span></div>`;
+  clearError();
+  if(d.chart_url){document.getElementById('chart').src=d.chart_url+'?t='+Date.now();}
+  var ph='';
+  (d.predictions||[]).forEach(function(p){var c=p.delta>=0?'up':'down';ph+='<div class="row"><span>'+escHtml(p.model)+'</span><span class="val '+c+'">$'+p.target.toFixed(2)+' ('+(p.delta>=0?'+':'')+p.delta.toFixed(2)+'%)</span></div>'});
+  if(ph)ph+='<div class="row" style="border-top:1px solid #333;margin-top:4px;padding-top:4px"><span>consensus</span><span class="val">'+escHtml(d.consensus||'N/A')+'</span></div><div class="row"><span>avg Δ</span><span class="val '+(d.avg_delta>=0?'up':'down')+'">'+(d.avg_delta||0).toFixed(2)+'%</span></div>';
   if(!ph)ph='<div class="row" style="color:#444">no data</div>';
-  $('pBody').innerHTML=ph;
-  let th='';const t2=d.technicals||{};
-  th+=`<div class="row"><span>RSI 14</span><span class="val">${t2.rsi!=null?t2.rsi.toFixed(2):'—'} ${t2.rsi_label||''}</span></div>`;
-  th+=`<div class="row"><span>EMA 50</span><span class="val">${t2.ema_label||'—'} ${t2.ema!=null?'$'+t2.ema.toFixed(2):''}</span></div>`;
-  th+=`<div class="row"><span>TD</span><span class="val">${t2.td_count!=null?'TD '+t2.td_count:'—'} ${t2.td_label||''}</span></div>`;
-  th+=`<div class="row"><span>VOL</span><span class="val">${t2.vol_label||'—'} ${t2.bb_upper!=null?'BB $'+t2.bb_upper.toFixed(2):''}</span></div>`;
-  $('tBody').innerHTML=th;
+  document.getElementById('pBody').innerHTML=ph;
+  var th='';var t2=d.technicals||{};
+  th+='<div class="row"><span>RSI 14</span><span class="val">'+(t2.rsi!=null?t2.rsi.toFixed(2):'—')+' '+(t2.rsi_label||'')+'</span></div>';
+  th+='<div class="row"><span>EMA 50</span><span class="val">'+(t2.ema_label||'—')+' '+(t2.ema!=null?'$'+t2.ema.toFixed(2):'')+'</span></div>';
+  th+='<div class="row"><span>TD</span><span class="val">'+(t2.td_count!=null?'TD '+t2.td_count:'—')+' '+(t2.td_label||'')+'</span></div>';
+  th+='<div class="row"><span>VOL</span><span class="val">'+(t2.vol_label||'—')+' '+(t2.bb_upper!=null?'BB $'+t2.bb_upper.toFixed(2):'')+'</span></div>';
+  document.getElementById('tBody').innerHTML=th;
 }
 function showAnalyst(d){
-  let ah='';const e=d.earnings||{};
-  if(e.available){const dc=e.days_until<=7?'#ff4444':e.days_until<=14?'#ff6b35':e.days_until<=30?'#ffaa00':'#00ff88';ah+=`<div class="row"><span>Earnings</span><span class="val" style="color:${dc}">${e.date} (${e.days_until}d)</span></div>`}
-  const a=d.analyst||{};
-  if(a.available){const tot=(a.total||1);const b2=((a.strong_buy+a.buy)/tot*100).toFixed(0),h2=(a.hold/tot*100).toFixed(0),s=((a.sell+a.strong_sell)/tot*100).toFixed(0);ah+=`<div class="analyst-bar"><div class="bar-buy" style="width:${b2}%">${b2>12?b2+'%':''}</div><div class="bar-hold" style="width:${h2}%">${h2>12?h2+'%':''}</div><div class="bar-sell" style="width:${s}%">${s>12?s+'%':''}</div></div>`;ah+=`<div class="legend"><span class="l-buy">buy ${a.strong_buy+a.buy}</span><span class="l-hold">hold ${a.hold}</span><span class="l-sell">sell ${a.sell+a.strong_sell}</span></div>`}
+  var ah='';var e=d.earnings||{};
+  if(e.available){var dc=e.days_until<=7?'#ff4444':e.days_until<=14?'#ff6b35':e.days_until<=30?'#ffaa00':'#00ff88';ah+='<div class="row"><span>Earnings</span><span class="val" style="color:'+dc+'">'+escHtml(e.date)+' ('+e.days_until+'d)</span></div>'}
+  var a=d.analyst||{};
+  if(a.available){var tot=(a.total||1);var b2=((a.strong_buy+a.buy)/tot*100).toFixed(0),h2=(a.hold/tot*100).toFixed(0),s=((a.sell+a.strong_sell)/tot*100).toFixed(0);ah+='<div class="analyst-bar"><div class="bar-buy" style="width:'+b2+'%">'+(b2>12?b2+'%':'')+'</div><div class="bar-hold" style="width:'+h2+'%">'+(h2>12?h2+'%':'')+'</div><div class="bar-sell" style="width:'+s+'%">'+(s>12?s+'%':'')+'</div></div>';ah+='<div class="legend"><span class="l-buy">buy '+(a.strong_buy+a.buy)+'</span><span class="l-hold">hold '+a.hold+'</span><span class="l-sell">sell '+(a.sell+a.strong_sell)+'</span></div>'}
   else if(!e.available)ah='<div class="row" style="color:#444">no data</div>';
-  $('aBody').innerHTML=ah;
+  document.getElementById('aBody').innerHTML=ah;
 }
 function showNews(d){
-  let nh='';(d.news||[]).forEach(n=>{nh+=`<li><a href="${n.url||'#'}" target="_blank">${n.title||''}</a><div class="meta">${n.date||''}</div></li>`});
+  var nh='';(d.news||[]).forEach(function(n){nh+='<li><a href="'+escHtml(n.url||'#')+'" target="_blank">'+escHtml(n.title||'')+'</a><div class="meta">'+escHtml(n.date||'')+'</div></li>'});
   if(!nh)nh='<li style="color:#444">no news</li>';
-  $('nList').innerHTML=nh;
+  document.getElementById('nList').innerHTML=nh;
 }
+function escHtml(s){if(!s)return '';var d=document.createElement('div');d.appendChild(document.createTextNode(s));return d.innerHTML}
+
+// Load cache status on page load
+loadCacheStatus();
 </script></body></html>"""
 
-@app.route("/")
-def index():
-    return render_template_string(PAGE)
-
-@app.route("/api/start", methods=["POST"])
-def api_start():
-    jid, cached = _submit_job(
-        request.form.get("target","APLD").upper(),
-        request.form.get("helper","NVDA").upper(),
-        int(request.form.get("horizon", 12)),
-        request.form.get("use_timesfm")=="true",
-        request.form.get("use_chronos")=="true",
-        request.form.get("use_lstm")=="true",
-        request.form.get("dataRange", "1y"),
-        request.form.get("chartType", "candle"),
-    )
-    if cached:
-        with _jobs_lock:
-            j = _jobs.get(jid, {})
-        return jsonify({"status": "done", "result": j.get("result", {})})
-
-    # Check if the running job has completed (proc.poll() detects exit)
-    with _jobs_lock:
-        j = _jobs.get(jid, {})
-    if j.get("status") == "running":
-        proc = j.get("proc")
-        if proc and proc.poll() is not None:
-            # Subprocess has exited but wasn't caught by _submit_job's check
-            # (race condition: exited between check and response)
-            _complete_job(jid, j)
-            with _jobs_lock:
-                j = _jobs.get(jid, {})
-        else:
-            # Still running — return progress info with ALL completed stages
-            resp = {"status": "started", "job_id": jid}
-            lines = j.get("status_lines", [])
-            if lines:
-                resp["last_line"] = lines[-1][:100]
-            completed_stages = []
-            current_stage = None
-            current_state = None
-            for line in lines:
-                if "[STATUS:" in line:
-                    parts = line.strip("[]").split(":")
-                    if len(parts) >= 3:
-                        stage = parts[1].strip()
-                        state = parts[2].strip()
-                        if state == "done":
-                            if stage not in completed_stages:
-                                completed_stages.append(stage)
-                        elif state == "running":
-                            current_stage = stage
-                            current_state = state
-            resp["completed_stages"] = completed_stages
-            if current_stage:
-                resp["model"] = current_stage
-                resp["model_state"] = current_state or "running"
-            return jsonify(resp)
-
-    # Return final status (done or error)
-    if j.get("status") == "done":
-        return jsonify({"status": "done", "result": j.get("result", {})})
-    elif j.get("status") == "error":
-        return jsonify({"status": "error", "result": j.get("result", {})})
-    else:
-        return jsonify({"status": "running", "job_id": jid})
-
-@app.route("/api/status")
-def api_status():
-    jid = request.args.get("jid","")
-    with _jobs_lock:
-        j = _jobs.get(jid)
-    if not j:
-        return jsonify({"error":"Job not found"}), 404
-    if j["status"] == "running" and j.get("proc") and j["proc"].poll() is not None:
-        _complete_job(jid, j)
-        with _jobs_lock:
-            j = _jobs.get(jid, {})
-    resp = {"status": j.get("status", "?")}
-    # Include progress info while running
-    if j.get("status") == "running":
-        # Extract latest [STATUS:...] marker
-        for line in reversed(j.get("status_lines", [])):
-            if "[STATUS:" in line:
-                resp["progress"] = line
-                # Parse model name and state from [STATUS:Name:state]
-                parts = line.strip("[]").split(":")
-                if len(parts) >= 3:
-                    resp["model"] = parts[1].strip()
-                    resp["model_state"] = parts[2].strip()
-                break
-    if j.get("status") in ("done","error"):
-        resp["result"] = j.get("result", {})
-    return jsonify(resp)
-
-@app.route("/chart/<path:chart_name>")
-def chart(chart_name):
-    p = WORKSPACE / chart_name
-    return send_file(p, mimetype="image/png") if p.exists() else ("",404)
-
-@app.route("/api/news/<ticker>")
-def api_news(ticker):
-    """Fetch news/analyst/earnings immediately — no forecast needed."""
-    try:
-        from news import get_news_and_ratings
-        nd = get_news_and_ratings(ticker.upper())
-        return jsonify({
-            "news": nd.get("news", [])[:10],
-            "analyst": nd.get("analyst", {"available": False}),
-            "earnings": nd.get("earnings", {"available": False}),
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/chart-ready/<path:chart_name>")
-def api_chart_ready(chart_name):
-    """Check if a chart file exists on disk."""
-    p = WORKSPACE / chart_name
-    return jsonify({"ready": p.exists() and p.stat().st_size > 1000})
-
-@app.route("/test")
-def test():
-    return send_file(WORKSPACE / "gui" / "test_standalone.html")
 
 if __name__ == "__main__":
-    print(f"Forecast GUI -> http://localhost:{PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    print(f"⚡ Forecast GUI v2 → http://localhost:{PORT}")
+    print(f"   WebSocket + Model Caching + Error Display")
+    socketio.run(app, host="0.0.0.0", port=PORT, debug=False, allow_unsafe_werkzeug=True)

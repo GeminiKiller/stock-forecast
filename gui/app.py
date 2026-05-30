@@ -778,7 +778,7 @@ h1 span{color:#ff6b35}
 .ws-status{font-size:10px;color:#333;text-align:right;float:right;margin-top:-20px;margin-bottom:10px}
 .ws-status.connected{color:#00ff88}
 .ws-status.disconnected{color:#ff4444}
-.autocomplete-wrapper{position:relative;display:inline-block}
+.autocomplete-wrapper{position:relative}
 .autocomplete-list{position:absolute;top:100%;left:0;right:0;background:#1a1a1a;border:1px solid #333;border-top:none;max-height:180px;overflow-y:auto;z-index:100;display:none}
 .autocomplete-list.active{display:block}
 .autocomplete-item{padding:5px 10px;cursor:pointer;font-size:12px;color:#c0c0c0;border-bottom:1px solid #1a1a1a}

@@ -888,6 +888,7 @@ h1 span{color:#ff6b35}
 .preview-item .pv.down{color:#ff4444}
 .sentiment-counts{font-size:11px;color:#666;margin:4px 0;display:flex;gap:12px}
 .sentiment-counts span{display:flex;align-items:center;gap:4px}
+</style>
 
   <div id="wsStatus" class="ws-status disconnected">⬤ offline</div>
 

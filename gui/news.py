@@ -5,6 +5,49 @@ import urllib.request
 import re
 from datetime import datetime
 
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    _sid = SentimentIntensityAnalyzer()
+except ImportError:
+    _sid = None
+
+# FinBERT (PyTorch) — much better financial sentiment
+try:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    _finbert_tokenizer = None
+    _finbert_model = None
+    _finbert_available = True
+except ImportError:
+    _finbert_available = False
+
+def _get_finbert():
+    global _finbert_tokenizer, _finbert_model
+    if _finbert_model is not None:
+        return _finbert_tokenizer, _finbert_model
+    _finbert_tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+    _finbert_model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+    _finbert_model.eval()
+    return _finbert_tokenizer, _finbert_model
+
+def _finbert_sentiment(text):
+    tokenizer, model = _get_finbert()
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        probs = torch.softmax(outputs.logits, dim=1)[0]
+    # FinBERT labels: 0=positive, 1=negative, 2=neutral
+    pos = probs[0].item()
+    neg = probs[1].item()
+    neu = probs[2].item()
+    compound = pos - neg
+    return {
+        "compound": round(compound, 4),
+        "pos": round(pos, 4),
+        "neu": round(neu, 4),
+        "neg": round(neg, 4),
+    }
+
 
 def fetch_yahoo_rss(ticker: str, max_items: int = 15) -> list[dict]:
     """Fetch latest news from Yahoo Finance RSS feed."""
@@ -125,14 +168,226 @@ def fetch_earnings_date(ticker: str) -> dict:
         return {"available": False, "message": str(e)}
 
 
+# Financial keyword lexicon for boosting sentiment scores
+FIN_POS = {
+    'surge':0.15,'surges':0.15,'surged':0.15,'rally':0.15,'rallies':0.15,'rallied':0.15,
+    'soar':0.2,'soared':0.2,'soaring':0.2,'gaining':0.1,'gain':0.1,'gains':0.1,
+    'up':0.05,'rises':0.1,'rising':0.1,'rose':0.1,'high':0.1,'highs':0.1,'record':0.1,
+    'breakthrough':0.2,'deal':0.1,'agreement':0.1,'partnership':0.1,'raised':0.15,
+    'upgrade':0.2,'upgraded':0.2,'outperform':0.2,'beat':0.15,'beats':0.15,'beating':0.15,
+    'profit':0.1,'profits':0.1,'growth':0.1,'bullish':0.3,'strong':0.1,'momentum':0.1,
+    'breakout':0.15,'jump':0.1,'jumps':0.1,'jumped':0.1,'spike':0.1,'spikes':0.1,
+    'spiked':0.1,'rocket':0.2,'rockets':0.2,'rocketed':0.2,'climb':0.1,'climbs':0.1,
+    'climbing':0.1,'advance':0.1,'advances':0.1,'buy':0.15,'overweight':0.15,
+    'accumulate':0.1,
+    'lease':0.15,'leases':0.15,'leasing':0.15,'signed':0.1,'signs':0.1,'signing':0.1,
+    'major':0.1,'expansion':0.15,'expanding':0.15,'expanded':0.15,
+    'facility':0.1,'facilities':0.1,'campus':0.05,'campuses':0.05,'new':0.05,
+    'building':0.1,'builds':0.1,'built':0.1,'construction':0.05,
+    'launch':0.15,'launches':0.15,'launched':0.15,'launching':0.15,
+    'deploy':0.1,'deploys':0.1,'deployed':0.1,'deployment':0.1,
+    'acquire':0.15,'acquires':0.15,'acquired':0.15,'acquisition':0.15,
+    'merge':0.1,'merges':0.1,'merged':0.1,'merger':0.1,
+    'contract':0.1,'contracts':0.1,'contracted':0.1,'contracting':0.1,
+    'order':0.1,'orders':0.1,'ordered':0.1,'ordering':0.1,
+    'booking':0.1,'bookings':0.1,'backlog':0.1,'pipeline':0.1,
+    'revenue':0.1,'revenues':0.1,'sales':0.1,'earnings':0.1,
+    'margin':0.05,'margins':0.05,'profitability':0.1,
+    'beat':0.15,'beats':0.15,'beating':0.15,'beaten':0.15,
+    'exceed':0.15,'exceeds':0.15,'exceeded':0.15,'exceeding':0.15,
+    'outperform':0.2,'outperforms':0.2,'outperformed':0.2,'outperforming':0.2,
+    'dominant':0.1,'leading':0.1,'leader':0.1,'top':0.1,'best':0.15,
+    'milestone':0.1,'achievement':0.1,'achieved':0.1,'achieves':0.1,'bounce':0.1,'bounces':0.1,'bounced':0.1,'rebound':0.1,
+    'rebounds':0.1,'rebounded':0.1,'lift':0.1,'lifts':0.1,'lifted':0.1,
+}
+FIN_NEG = {
+    'drop':-0.15,'drops':-0.15,'dropping':-0.15,'fall':-0.15,'falls':-0.15,
+    'falling':-0.15,'down':-0.05,'crash':-0.3,'crashes':-0.3,'crashed':-0.3,
+    'bearish':-0.3,'weak':-0.15,'miss':-0.2,'misses':-0.2,'missed':-0.2,
+    'cut':-0.15,'cuts':-0.15,'downgrade':-0.2,'downgraded':-0.2,'lawsuit':-0.2,
+    'investigation':-0.2,'debt':-0.1,'loss':-0.15,'losses':-0.15,'declining':-0.15,
+    'plunge':-0.25,'plummet':-0.25,'tank':-0.25,'underperform':-0.2,'sell':-0.15,
+    'underweight':-0.15,'reduce':-0.1,'avoid':-0.15,'warning':-0.15,'concern':-0.1,
+    'risk':-0.1,'risks':-0.1,'volatile':-0.1,'volatility':-0.1,'tumble':-0.2,
+    'tumbles':-0.2,'tumbled':-0.2,'slide':-0.15,'slides':-0.15,'sliding':-0.15,
+    'slumped':-0.2,'slumps':-0.2,'slumping':-0.2,'plunged':-0.25,'plunging':-0.25,
+    'plummeted':-0.25,'plummeting':-0.25,'crashing':-0.3,'collapse':-0.3,
+    'collapses':-0.3,'collapsed':-0.3,'dive':-0.15,'dives':-0.15,'dived':-0.15,
+    'plunge':-0.25,'nosedive':-0.25,'nosedives':-0.25,'nosedived':-0.25,
+    'stagnant':-0.1,'stagnation':-0.1,'struggle':-0.1,'struggles':-0.1,
+    'struggling':-0.1,'headwind':-0.1,'headwinds':-0.1,'layoff':-0.2,
+    'layoffs':-0.2,'fired':-0.15,'firing':-0.15,'delay':-0.1,'delays':-0.1,
+    'delayed':-0.1,'postpone':-0.1,'postponed':-0.1,'cancel':-0.15,
+    'cancels':-0.15,'cancelled':-0.15,'cancelling':-0.15,'halt':-0.15,
+    'halts':-0.15,'halted':-0.15,'suspend':-0.15,'suspends':-0.15,
+    'suspended':-0.15,'fraud':-0.3,'scandal':-0.25,'bankrupt':-0.3,
+    'bankruptcy':-0.3,'default':-0.25,'defaults':-0.25,'recession':-0.2,
+    'inflation':-0.1,'tariff':-0.1,'tariffs':-0.1,'sanction':-0.15,
+    'sanctions':-0.15,'ban':-0.15,'bans':-0.15,'banned':-0.15,'fine':-0.15,
+    'fines':-0.15,'fined':-0.15,'penalty':-0.15,'penalties':-0.15,
+    'losing':-0.15,'loses':-0.15,'lose':-0.15,'lost':-0.15,'dip':-0.1,
+    'dips':-0.1,'dipped':-0.1,'retreat':-0.1,'retreats':-0.1,'retreated':-0.1,
+}
+
+def _fin_keyword_boost(text: str) -> float:
+    """Compute financial keyword boost for a headline."""
+    if not text:
+        return 0.0
+    text_lower = text.lower()
+    boost = 0.0
+    # Check multi-word phrases first
+    for phrase, val in list(FIN_POS.items()) + list(FIN_NEG.items()):
+        if ' ' in phrase and phrase in text_lower:
+            boost += val
+    # Then single words
+    words = set(re.findall(r'\b\w+\b', text_lower))
+    for word in words:
+        boost += FIN_POS.get(word, 0.0)
+        boost += FIN_NEG.get(word, 0.0)
+    return max(-0.5, min(0.5, boost))  # clamp boost to ±0.5
+
+def analyze_sentiment(headlines: list[dict]) -> list[dict]:
+    """Add FinBERT sentiment scores to each headline (VADER fallback if unavailable).
+    
+    Adds: sentiment.compound, sentiment.pos, sentiment.neu, sentiment.neg, sentiment.emoji
+    Returns the same list with sentiment field added to each dict.
+    """
+    if not _finbert_available:
+        # Fallback to keyword-boosted VADER
+        if _sid is None:
+            for item in headlines:
+                item["sentiment"] = {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0, "emoji": "⚪"}
+            return headlines
+        for item in headlines:
+            text = (item.get("title", "") + ". " + item.get("description", "")).strip()
+            if not text:
+                item["sentiment"] = {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0, "emoji": "⚪"}
+                continue
+            scores = _sid.polarity_scores(text)
+            boost = _fin_keyword_boost(text)
+            compound = max(-1.0, min(1.0, scores["compound"] + boost))
+            if compound > 0.0:
+                emoji = "🟢"
+            elif compound < 0.0:
+                emoji = "🔴"
+            else:
+                emoji = "⚪"
+            item["sentiment"] = {
+                "compound": round(compound, 4),
+                "pos": round(scores["pos"], 4),
+                "neu": round(scores["neu"], 4),
+                "neg": round(scores["neg"], 4),
+                "emoji": emoji,
+            }
+        return headlines
+    
+    # FinBERT path (pure — understands financial context natively)
+    for item in headlines:
+        text = (item.get("title", "") + ". " + item.get("description", "")).strip()
+        if not text:
+            item["sentiment"] = {"compound": 0.0, "pos": 0.0, "neu": 1.0, "neg": 0.0, "emoji": "⚪"}
+            continue
+        scores = _finbert_sentiment(text)
+        compound = scores["compound"]
+        if compound > 0.1:
+            emoji = "🟢"
+        elif compound < -0.1:
+            emoji = "🔴"
+        else:
+            emoji = "⚪"
+        item["sentiment"] = {**scores, "emoji": emoji}
+    return headlines
+
+def compute_sentiment_summary(headlines: list[dict]) -> dict:
+    """Compute overall sentiment with recency weighting and trend.
+    
+    Returns: {"label": "...", "emoji": "...", "avg_compound": float, 
+              "weighted_compound": float, "trend": "improving"/"stable"/"deteriorating",
+              "trend_emoji": "↗️"/"➡️"/"↘️", "trend_label": "..."}
+    """
+    from datetime import datetime
+    import math
+    
+    scored_items = []
+    now = datetime.now()
+    
+    for item in headlines:
+        s = item.get("sentiment", {})
+        c = s.get("compound")
+        if c is None:
+            continue
+        # Parse date for recency weight
+        date_str = item.get("date", "")
+        days_ago = 7  # default: week old
+        try:
+            dt = datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S %z")
+            days_ago = max(0, (now - dt.replace(tzinfo=None)).days)
+        except:
+            pass
+        # Exponential decay: weight = exp(-days/5) → half-life of ~3.5 days
+        weight = math.exp(-days_ago / 5.0)
+        scored_items.append({"compound": c, "days_ago": days_ago, "weight": weight})
+    
+    if not scored_items:
+        return {"label": "Neutral", "emoji": "⚪", "avg_compound": 0.0,
+                "weighted_compound": 0.0, "trend": "stable", "trend_emoji": "➡️", "trend_label": "Stable"}
+    
+    # Simple average
+    avg = sum(it["compound"] for it in scored_items) / len(scored_items)
+    
+    # Recency-weighted average
+    total_weight = sum(it["weight"] for it in scored_items)
+    weighted = sum(it["compound"] * it["weight"] for it in scored_items) / total_weight if total_weight > 0 else 0
+    
+    # Trend: compare recent half vs older half
+    scored_items.sort(key=lambda x: x["days_ago"])
+    mid = len(scored_items) // 2
+    if mid > 0:
+        recent_avg = sum(it["compound"] for it in scored_items[:mid]) / mid
+        older_avg = sum(it["compound"] for it in scored_items[mid:]) / (len(scored_items) - mid)
+        diff = recent_avg - older_avg
+        if diff > 0.05:
+            trend, trend_emoji, trend_label = "improving", "↗️", "Improving"
+        elif diff < -0.05:
+            trend, trend_emoji, trend_label = "deteriorating", "↘️", "Cooling"
+        else:
+            trend, trend_emoji, trend_label = "stable", "➡️", "Stable"
+    else:
+        trend, trend_emoji, trend_label = "stable", "➡️", "Stable"
+    
+    # Use weighted compound for classification (more reactive to breaking news)
+    score = weighted
+    if score > 0.1:
+        label, emoji = "Bullish", "🟢"
+    elif score < -0.1:
+        label, emoji = "Bearish", "🔴"
+    else:
+        label, emoji = "Neutral", "⚪"
+    
+    return {
+        "label": label, "emoji": emoji,
+        "avg_compound": round(avg, 4),
+        "weighted_compound": round(weighted, 4),
+        "trend": trend, "trend_emoji": trend_emoji, "trend_label": trend_label
+    }
+
+
 def get_news_and_ratings(ticker: str) -> dict:
-    """Combined news + analyst data + earnings."""
+    """Combined news + analyst data + earnings + sentiment."""
+    news = fetch_yahoo_rss(ticker)
+    # Filter out error-only items before sentiment analysis
+    valid_news = [n for n in news if "error" not in n]
+    analyze_sentiment(valid_news)
+    summary = compute_sentiment_summary(valid_news)
+    # Merge valid news back (error items go at the end unchanged)
+    processed = valid_news + [n for n in news if "error" in n]
     return {
         "ticker": ticker.upper(),
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "analyst": fetch_analyst_ratings(ticker),
         "earnings": fetch_earnings_date(ticker),
-        "news": fetch_yahoo_rss(ticker),
+        "news": processed,
+        "sentiment_summary": summary,
     }
 
 
@@ -141,3 +396,213 @@ if __name__ == "__main__":
     t = sys.argv[1] if len(sys.argv) > 1 else "NVDA"
     result = get_news_and_ratings(t)
     print(json.dumps(result, indent=2))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  FUNDAMENTALS + AI SCORE
+# ═══════════════════════════════════════════════════════════════
+
+# ── Fundamental metrics ──
+def get_fundamentals(ticker: str) -> dict:
+    """Fetch key fundamental metrics via yfinance."""
+    try:
+        import yfinance as yf
+        t = yf.Ticker(ticker)
+        info = t.info
+        
+        def _get(key, default=None):
+            return info.get(key, default)
+        
+        fundamentals = {
+            "available": True,
+            "pe_trailing": _get("trailingPE"),
+            "pe_forward": _get("forwardPE"),
+            "eps": _get("trailingEps"),
+            "eps_growth": _get("earningsGrowth"),
+            "revenue": _get("totalRevenue"),
+            "revenue_growth": _get("revenueGrowth"),
+            "profit_margin": _get("profitMargins"),
+            "debt_equity": _get("debtToEquity"),
+            "roe": _get("returnOnEquity"),
+            "roa": _get("returnOnAssets"),
+            "current_ratio": _get("currentRatio"),
+            "quick_ratio": _get("quickRatio"),
+            "dividend_yield": _get("dividendYield"),
+            "market_cap": _get("marketCap"),
+            "beta": _get("beta"),
+            "sector": _get("sector"),
+            "industry": _get("industry"),
+            "employees": _get("fullTimeEmployees"),
+        }
+        
+        def fmt_num(n):
+            if n is None: return None
+            if abs(n) >= 1e12: return f"{n/1e12:.2f}T"
+            if abs(n) >= 1e9: return f"{n/1e9:.2f}B"
+            if abs(n) >= 1e6: return f"{n/1e6:.2f}M"
+            return f"{n:.2f}"
+        
+        def fmt_pct(n):
+            if n is None: return None
+            return f"{n*100:.1f}%"
+        
+        fundamentals["revenue_fmt"] = fmt_num(fundamentals["revenue"])
+        fundamentals["market_cap_fmt"] = fmt_num(fundamentals["market_cap"])
+        fundamentals["profit_margin_fmt"] = fmt_pct(fundamentals["profit_margin"])
+        fundamentals["revenue_growth_fmt"] = fmt_pct(fundamentals["revenue_growth"])
+        fundamentals["eps_growth_fmt"] = fmt_pct(fundamentals["eps_growth"])
+        fundamentals["dividend_yield_fmt"] = fmt_pct(fundamentals["dividend_yield"])
+        fundamentals["roe_fmt"] = fmt_pct(fundamentals["roe"])
+        fundamentals["roa_fmt"] = fmt_pct(fundamentals["roa"])
+        
+        return fundamentals
+    except Exception as e:
+        return {"available": False, "message": str(e)}
+
+
+# ── AI Score (0-100) ──
+def compute_ai_score(price_data: dict, tech: dict, sentiment: dict, analyst: dict) -> dict:
+    """Compute overall AI score (0-100) from all signals.
+    
+    Weights: Technical 30%, Sentiment 25%, Analyst 25%, Momentum 20%
+    """
+    score = 0
+    max_score = 0
+    details = {}
+    
+    # 1. Technical Score (30 pts)
+    tech_score = 0
+    tech_max = 30
+    
+    # RSI: 50=center, <30=oversold (+), >70=overbought (-)
+    rsi = tech.get("rsi")
+    if rsi is not None:
+        if rsi <= 30:
+            rsi_pts = 10
+        elif rsi >= 70:
+            rsi_pts = 0
+        else:
+            rsi_pts = max(0, 10 - abs(rsi - 50) / 2)
+        tech_score += rsi_pts
+        details["rsi"] = round(rsi_pts, 1)
+    
+    # EMA trend
+    ema_label = tech.get("ema_label")
+    if ema_label == "BULLISH":
+        tech_score += 10
+        details["ema"] = 10
+    elif ema_label == "BEARISH":
+        details["ema"] = 0
+    else:
+        details["ema"] = 5
+        tech_score += 5
+    
+    # TD Sequential
+    td_count = tech.get("td_count", 0)
+    if td_count >= 1 and td_count <= 4:
+        td_pts = 5
+    elif td_count >= 5 and td_count <= 8:
+        td_pts = 7
+    elif td_count >= 9:
+        td_pts = 10
+    else:
+        td_pts = 5
+    tech_score += td_pts
+    details["td"] = td_pts
+    
+    score += tech_score
+    max_score += tech_max
+    details["technical"] = round(tech_score, 1)
+    
+    # 2. Sentiment Score (25 pts)
+    sent_score = 0
+    sent_max = 25
+    compound = sentiment.get("compound", 0)
+    sent_score = ((compound + 1) / 2) * 25
+    score += sent_score
+    max_score += sent_max
+    details["sentiment"] = round(sent_score, 1)
+    
+    # 3. Analyst Score (25 pts)
+    analyst_score = 0
+    analyst_max = 25
+    
+    if analyst.get("available"):
+        rec = analyst.get("recommendation", "")
+        rec_map = {
+            "strong_buy": 25, "buy": 20, "hold": 12, "sell": 5, "strong_sell": 0
+        }
+        analyst_score = rec_map.get(rec, 12)
+    else:
+        analyst_score = 12
+    
+    score += analyst_score
+    max_score += analyst_max
+    details["analyst"] = round(analyst_score, 1)
+    
+    # 4. Momentum Score (20 pts)
+    mom_score = 0
+    mom_max = 20
+    
+    # Price momentum vs 52wk range
+    high = tech.get("52wk_high")
+    low = tech.get("52wk_low")
+    current = tech.get("current_price")
+    if high and low and current and high > low:
+        pct = (current - low) / (high - low)
+        if pct >= 0.6 and pct <= 0.8:
+            mom_pts = 15
+        elif pct > 0.8:
+            mom_pts = 10
+        elif pct >= 0.4:
+            mom_pts = 10
+        else:
+            mom_pts = 5
+        mom_score += mom_pts
+    else:
+        mom_score += 10
+    
+    # Volume momentum
+    vol_label = tech.get("vol_label", "")
+    if vol_label.startswith("Above avg"):
+        mom_score += 5
+    elif vol_label.startswith("Below avg"):
+        mom_score += 2
+    else:
+        mom_score += 3
+    
+    score += mom_score
+    max_score += mom_max
+    details["momentum"] = round(mom_score, 1)
+    
+    # Normalize to 0-100
+    if max_score > 0:
+        final_score = (score / max_score) * 100
+    else:
+        final_score = 50
+    
+    final_score = max(0, min(100, final_score))
+    
+    if final_score >= 80:
+        label, emoji = "Strong Buy", "🟢"
+    elif final_score >= 60:
+        label, emoji = "Buy", "🟢"
+    elif final_score >= 40:
+        label, emoji = "Hold", "⚪"
+    elif final_score >= 20:
+        label, emoji = "Sell", "🔴"
+    else:
+        label, emoji = "Strong Sell", "🔴"
+    
+    return {
+        "score": round(final_score, 1),
+        "label": label,
+        "emoji": emoji,
+        "details": details,
+        "components": {
+            "technical": round((details["technical"] / tech_max) * 100, 1) if tech_max > 0 else 0,
+            "sentiment": round((details["sentiment"] / sent_max) * 100, 1) if sent_max > 0 else 0,
+            "analyst": round((details["analyst"] / analyst_max) * 100, 1) if analyst_max > 0 else 0,
+            "momentum": round((details["momentum"] / mom_max) * 100, 1) if mom_max > 0 else 0,
+        }
+    }

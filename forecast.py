@@ -5,10 +5,12 @@ Runs each model in its own subprocess to avoid dependency conflicts.
 
 Usage:
   python forecast.py TARGET [HELPER] [OPTIONS]
+  python forecast.py TARGET [HELPER] --data-only   # Skip models + chart, just download data
 
 Examples:
   python forecast.py APLD
   python forecast.py APLD NVDA
+  python forecast.py APLD NVDA --data-only --horizon 12
   python forecast.py TSLA SPY --start 2025-01-01 --horizon 20
   python forecast.py BTC-USD --no-timesfm --no-lstm
 """
@@ -44,6 +46,8 @@ parser.add_argument("--chart-type",  type=str, default="candle",
 parser.add_argument("--no-timesfm",  action="store_true", help="Skip TimesFM model")
 parser.add_argument("--no-chronos",  action="store_true", help="Skip Chronos-2 model")
 parser.add_argument("--no-lstm",     action="store_true", help="Skip LSTM model")
+parser.add_argument("--data-only",   action="store_true",
+                    help="Only download data + indicators (skip models and chart). Outputs JSON metadata.")
 parser.add_argument("--output",      type=str, default=None,
                     help="Output chart path (default: TARGET_forecast.png)")
 
@@ -54,6 +58,7 @@ HORIZON   = args.horizon
 SKIP_TFM  = args.no_timesfm
 SKIP_CHR  = args.no_chronos
 SKIP_LSTM = args.no_lstm
+DATA_ONLY = args.data_only
 CHART_TYPE = args.chart_type
 
 # Compute start date from data-range if not explicitly set
@@ -138,10 +143,55 @@ current_price = float(target_vals[-1])
 
 print(f"  Data: {len(target_vals)} rows | Current {TARGET}: ${current_price:.2f}")
 
+# Save CSV for model inference
 df[['close', 'helper']].to_csv(DATA_CSV)
 
+def td_label(count):
+    if count is None or count == 0:
+        return "—"
+    if count == 9:
+        return "⚠️ TD 9 — Potential Reversal"
+    if count >= 10:
+        return f"Countdown ({count})"
+    if count >= 5:
+        return "Setup Active"
+    return "Setup Building"
+
+# ── DATA-ONLY MODE: output JSON and exit ──
+if DATA_ONLY:
+    print(f"[STATUS:data_ready:done]", flush=True)
+    # Output metadata as JSON to stdout for the Flask process to consume
+    td_count = int(df['td_count'].iloc[-1])
+    metadata = {
+        "target": TARGET,
+        "helper": HELPER,
+        "horizon": HORIZON,
+        "data_range": args.data_range,
+        "chart_type": CHART_TYPE,
+        "current_price": current_price,
+        "data_rows": len(target_vals),
+        "csv_path": DATA_CSV,
+        "chart_path": OUT_CHART,
+        "data_range_raw": START if PERIOD else args.start,
+        "rsi": float(df['RSI_14'].iloc[-1]),
+        "ema_50": float(df['EMA_50'].iloc[-1]),
+        "bb_upper": float(df['BBU_20'].iloc[-1]),
+        "td_count": td_count,
+        "rsi_label": "[OVERBOUGHT]" if float(df['RSI_14'].iloc[-1]) > 70 else "[OVERSOLD]" if float(df['RSI_14'].iloc[-1]) < 30 else "[STABLE]",
+        "ema_label": "BULLISH" if current_price > float(df['EMA_50'].iloc[-1]) else "BEARISH",
+        "td_label": "⚠️ TD 9 — Potential Reversal" if td_count == 9 else f"Countdown ({td_count})" if td_count >= 10 else "Setup Active" if td_count >= 5 else "Setup Building" if td_count > 0 else "—",
+        "vol_label": "OVEREXTENDED" if current_price > float(df['BBU_20'].iloc[-1]) else "NORMAL",
+    }
+    print(f"[METADATA_JSON]{json.dumps(metadata)}[/METADATA_JSON]", flush=True)
+    # Print verification log
+    print(f"\n{'='*60}")
+    print(f"  DATA-ONLY: {TARGET}  (macro: {HELPER},  current: ${current_price:.2f})")
+    print(f"  CSV: {DATA_CSV}")
+    print(f"  Rows: {len(target_vals)}")
+    print(f"{'='*60}\n")
+    sys.exit(0)
 # ==========================================
-# 2. RUN MODELS
+# 2. RUN MODELS (subprocess mode — original behavior)
 # ==========================================
 
 def run_subprocess(name, script, extra_args=None):
@@ -352,7 +402,6 @@ try:
         c = ohlc_arr[j, 3]
         o = ohlc_arr[j, 0]
         color = '#00ff88' if c >= o else '#ff4444'
-        # Normalize to 0-1 range for consistent bar height
         bar_h = (v / max_vol) * 0.8 if max_vol > 0 else 0
         ax2.bar(j, bar_h, color=color, width=0.7, alpha=0.5, zorder=2, bottom=0.05)
     # Volume moving average line
@@ -487,7 +536,7 @@ bb_u     = float(df['BBU_20'].iloc[-1])
 rsi_label = '[OVERBOUGHT]' if rsi_val > 70 else '[OVERSOLD]' if rsi_val < 30 else '[STABLE]'
 print(f"| RSI (14)    : {rsi_val:6.2f} | {rsi_label}")
 print(f"| EMA 50      : {'BULLISH' if current_price > ema_50 else 'BEARISH':>12} | (EMA: ${ema_50:.2f})")
-print(f"| TD SETUP    : {td_count:>12} | {'!!! SELL FLIP !!!' if td_count >= 8 else 'Trend Continuing'}")
+print(f"| TD SETUP    : {td_count:>12} | {td_label(td_count)}")
 bb_label  = 'OVEREXTENDED' if current_price > bb_u else 'NORMAL'
 print(f"| VOLATILITY  : {bb_label:>12} | (BB Upper: ${bb_u:.2f})")
 
